@@ -1,11 +1,9 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from datetime import datetime, timedelta
 import matplotlib.dates as mdates
 from matplotlib.dates import DateFormatter
-import requests
 import openmeteo_requests
 import requests_cache
 from retry_requests import retry
@@ -24,13 +22,13 @@ class PreprocessingPipeline:
                                           "atmospheric_pressure": [710, 805], "relative_humidity": [10, 100],
                                           "dew_point_temperature": [-50, 24], "pressure_derivative": [-0.00038, 0.00038],
                                           "wind_forecast_three_hours": [0, 32], "day_of_year": [0, 366]}
-        self.time_threshold_for_gaps = 15
-        self.minmax_for_scaling_dict = {"air_temperature": [-30, 30], "wind_speed_horizontal": [0, 25],
+        self.ranges_for_scaling_dict = {"air_temperature": [-30, 30], "wind_speed_horizontal": [0, 25],
                                           "wind_direction": [0, 360], "wind_speed_min": [0, 25],
                                           "wind_speed_max": [0, 25], "wind_speed_vertical": [-25, 25],
                                           "atmospheric_pressure": [730, 780], "relative_humidity": [30, 100],
                                           "dew_point_temperature": [-30, 30], "pressure_derivative": [-0.00026, 0.00026],
                                           "wind_forecast_three_hours": [0, 25], "day_of_year": [0, 366]}
+        self.time_threshold_for_gaps = 15
 
     def _load_data(self):
         print("=" * 50)
@@ -48,6 +46,10 @@ class PreprocessingPipeline:
         print("МОДИФИКАЦИЯ КОЛОНКИ ДАТЫ-ВРЕМЕНИ")
         print("=" * 50)
 
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
         # Для удобства преобразуем время в DateTime без часовой зоны
         self.df['date'] = pd.to_datetime(self.df['date']).dt.tz_localize(None)
 
@@ -59,6 +61,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("УДАЛЕНИЕ СТАРЫХ ДАННЫХ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
 
         old_count = len(self.df[self.df['date'].dt.year < 2022])
         if old_count > 0:
@@ -73,6 +79,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("УДАЛЕНИЕ ДУБЛИКАТОВ (ЕСЛИ ЕСТЬ)")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
 
         str_num_before = self.df.shape[0]
         print(f"Количество строк до удаления дубликатов: {str_num_before}")
@@ -91,18 +101,26 @@ class PreprocessingPipeline:
         print("УДАЛЕНИЕ НЕНУЖНЫХ ПРИЗНАКОВ")
         print("=" * 50)
 
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
         # Удаляем признаки (малоинформативные или сильно коррелирующие с другими признаками)
         features_to_drop = ['vapor_pressure', 'absolute_humidity', 'air_density', 
                             'speed_of_sound', 'CFSv2_temperature', 'cloud_mixing']
         self.df = self.df.drop(features_to_drop, axis=1)
 
-        print(f"Удалены признаки: {", ".join(features_to_drop)}")
+        print(f"Удалены признаки:\n{", ".join(features_to_drop)}")
         return self
 
     def _add_day_of_year_feature(self):
         print("\n" + "=" * 50)
         print("ДОБАВЛЕНИЕ ПРИЗНАКА ДНЯ ГОДА")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
 
         # День года (1-365/366)
         self.df['day_of_year'] = self.df['date'].dt.dayofyear
@@ -116,6 +134,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("ДОБАВЛЕНИЕ ПРОИЗВОДНОЙ АТМОСФЕРНОГО ДАВЛЕНИЯ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
         
         # Признак атмосферного давления
         pressure_col = "atmospheric_pressure"
@@ -160,6 +182,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("УСТРАНЕНИЕ ВЫБРОСОВ И АНОМАЛИЙ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
         
         numerical_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
         exclude_cols = ['sin_time_of_day', 'cos_time_of_day', 'day_of_year']
@@ -235,6 +261,10 @@ class PreprocessingPipeline:
         print("ВОСПОЛНЕНИЕ КОРОТКИХ ВРЕМЕННЫХ ПРОПУСКОВ")
         print("=" * 50)
 
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
         time_threshold = self.time_threshold_for_gaps
         date_col = 'date'
 
@@ -296,6 +326,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("УДАЛЕНИЕ ПРОДОЛЖИТЕЛЬНЫХ NAN-ПРОПУСКОВ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
 
         print(f"Строк в датафрейме: {len(self.df)}")
 
@@ -372,6 +406,10 @@ class PreprocessingPipeline:
         print("ЗАПОЛНЕНИЕ NAN-ПРОПУСКОВ")
         print("=" * 50)
 
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
         # Выведем количество NaN-пропусков (до заполнения)
         print("Количество пропусков (до заполнения):")
         print(self.df.isna().sum())
@@ -410,124 +448,62 @@ class PreprocessingPipeline:
 
         return self
 
-    def _smooth_noisy_features(self):
-        # Сглаживание зашумленных признаков
+    def _smooth_pressure_and_temp_features(self):
+        # Сглаживание признаков давления и температуры
         print("\n" + "=" * 50)
-        print("СГЛАЖИВАНИЕ ЗАШУМЛЕННЫХ ПРИЗНАКОВ")
+        print("СГЛАЖИВАНИЕ ПРИЗНАКОВ ДАВЛЕНИЯ И ТЕМПЕРАТУРЫ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
         
-        # Исключаемые колонки (не сглаживаем)
-        exclude_columns = ['date', 'day_of_year', 'sin_time_of_day', 'cos_time_of_day',
-                          'wind_direction', 'relative_humidity']
+        # Признаки для сглаживания
+        smooth_config = {
+            'atmospheric_pressure': {'window': 10, 'rounding': 2},
+            'pressure_derivative': {'window': 3, 'rounding': 6},
+            'air_temperature': {'window': 10, 'rounding': 2},
+            'dew_point_temperature': {'window': 10, 'rounding': 2}
+        }
         
-        # Числовые колонки для сглаживания
-        numeric_columns = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        columns_to_smooth = [col for col in numeric_columns if col not in exclude_columns]
+        columns_to_smooth = [col for col in smooth_config.keys() if col in self.df.columns]
         
         if not columns_to_smooth:
-            print("Нет признаков для сглаживания")
+            print("Не найдено признаков давления или температуры для сглаживания")
             return self
         
         df_temp = self.df.copy()
         df_temp['date'] = pd.to_datetime(df_temp['date'])
-        df_temp = df_temp.set_index('date')
-        
-        smoothed_features = []
-        not_smoothed_features = []
+        df_temp = df_temp.set_index('date').sort_index()
         
         for col in columns_to_smooth:
-            series = df_temp[col].dropna()
+            config = smooth_config[col]
+            series = df_temp[col]
             
-            if len(series) < 100:
-                print(f"{col}: недостаточно данных, сглаживание пропущено")
+            if len(series.dropna()) < 100:
+                print(f"\n{col}: недостаточно данных, сглаживание пропущено")
                 continue
             
-            # Определяем, нужно ли сглаживать
-            need_smoothing = False
-            window_minutes = 10  # окно по умолчанию
+            original_series = self.df[col].copy()
             
-            # Атмосферное давление и температуры сглаживаем всегда
-            if col == 'atmospheric_pressure' or 'temperature' in col:
-                need_smoothing = True
-                window_minutes = 10
-            elif col == 'pressure_derivative':
-                # Анализируем уровень шума для производной
-                diff_1 = series.diff().abs().median()
-                rolling_std = series.rolling(window=10, min_periods=3).std().median()
-                ma_short = series.rolling(window=5, min_periods=3).mean()
-                high_freq_noise = (series - ma_short).abs().median()
-                noise_score = (diff_1 + rolling_std + high_freq_noise) / 3
-                
-                # Ожидаемый уровень шума для производной (мм рт.ст./сек)
-                expected_noise = 0.00005
-                
-                if noise_score > expected_noise * 1.5:
-                    need_smoothing = True
-                    # Для производной используем маленькое окно (2-3 минуты)
-                    window_minutes = 3 if noise_score < expected_noise * 2.5 else 5
-            else:
-                # Для остальных признаков анализируем уровень шума
-                diff_1 = series.diff().abs().median()
-                rolling_std = series.rolling(window=10, min_periods=3).std().median()
-                ma_short = series.rolling(window=5, min_periods=3).mean()
-                high_freq_noise = (series - ma_short).abs().median()
-                noise_score = (diff_1 + rolling_std + high_freq_noise) / 3
-                
-                # Определяем ожидаемый уровень шума
-                if 'air_temperature' in col.lower():
-                    expected_noise = 0.15
-                elif 'wind_speed' in col.lower():
-                    expected_noise = 0.25
-                elif 'dew_point' in col.lower():
-                    expected_noise = 0.2
-                else:
-                    expected_noise = 0.15
-                
-                # Решение о сглаживании
-                if noise_score > expected_noise * 1.5:
-                    need_smoothing = True
-                    if 'wind_speed' in col.lower():
-                        window_minutes = 3 if noise_score < expected_noise * 2.5 else 8
-                    else:
-                        window_minutes = 5 if noise_score < expected_noise * 2.5 else 15
+            # Используем rolling median для всего ряда сразу (быстрее)
+            window_size = config['window']
+            smoothed = series.rolling(window=window_size, center=True, min_periods=3).median()
             
-            # Выполняем сглаживание если нужно
-            if need_smoothing:
-                # Сохраняем оригинал
-                original_series = self.df[col].copy()
-                
-                # Выполняем сглаживание
-                smoothed_count = 0
-                for i in range(len(series)):
-                    current_time = series.index[i]
-                    start_time = current_time - pd.Timedelta(minutes=window_minutes/2)
-                    end_time = current_time + pd.Timedelta(minutes=window_minutes/2)
-                    
-                    window_points = series[(series.index >= start_time) & (series.index <= end_time)]
-                    
-                    if len(window_points) >= 3:
-                        smoothed_value = window_points.median()
-                        mask = self.df['date'] == current_time
-                        if col == 'pressure_derivative':
-                            self.df.loc[mask, col] = round(smoothed_value, 6)
-                        else:
-                            self.df.loc[mask, col] = round(smoothed_value, 2)
-                        smoothed_count += 1
-                
-                # Оценка
-                original_diff = original_series.diff().abs().median()
-                after_smoothing = self.df[col].copy()
-                smoothed_diff = after_smoothing.diff().abs().median()
-                noise_reduction = (1 - smoothed_diff / original_diff) * 100 if original_diff > 0 else 0
-                
-                print(f"\n{col}:")
-                print(f"   → Выполняется сглаживание")
-                print(f"   → Снижение шума: {noise_reduction:.1f}%")
-                
-                smoothed_features.append(col)
-            else:
-                # Признак не требует сглаживания
-                not_smoothed_features.append(col)
+            # Обновляем значения
+            for idx, val in smoothed.items():
+                if not pd.isna(val):
+                    self.df.loc[self.df['date'] == idx, col] = round(val, config['rounding'])
+            
+            # Оценка
+            original_diff = original_series.diff().abs().median()
+            after_smoothing = self.df[col].copy()
+            smoothed_diff = after_smoothing.diff().abs().median()
+            noise_reduction = (1 - smoothed_diff / original_diff) * 100 if original_diff > 0 else 0
+            
+            print(f"\n{col}:")
+            print(f"   → Сглаживание (окно {config['window']} мин)")
+            print(f"   → Снижение шума: {noise_reduction:.1f}%")
         
         print(f"\nСглаживание завершено")
         
@@ -538,6 +514,10 @@ class PreprocessingPipeline:
         print("ДОБАВЛЕНИЕ КОЛОНКИ ПРОГНОЗА СКОРОСТИ ВЕТРА НА 3 ЧАСА ВПЕРЁД")
         print("(АРХИВНЫЕ ПРОГНОЗЫ ДЛЯ ТОМСКА И ТОМСКОЙ ОБЛАСТИ С OPEN METEO API)")
         print("=" * 60)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
         
         # Координаты станции
         input_file_name = os.path.basename(self.input_file_path)
@@ -706,6 +686,10 @@ class PreprocessingPipeline:
         print("СРАВНЕНИЕ СКОРОСТИ ВЕТРА И ЕЁ ПРОГНОЗА")
         print("(НА КОРОТКИХ ВРЕМЕННЫХ УЧАСТКАХ)")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
         
         # Создаём копию dataframe чтобы не модифицировать оригинал
         df_copy = self.df.copy()
@@ -800,6 +784,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("ВИЗУАЛИЗАЦИЯ ДАННЫХ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
         
         # Получаем список колонок для построения графиков
         columns_to_plot = self.df.columns[1:]
@@ -838,19 +826,24 @@ class PreprocessingPipeline:
         print("МАСШТАБИРОВАНИЕ ДАННЫХ")
         print("=" * 50)
 
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
         # Столбцы для исключения
         exclude_columns = ['date', 'sin_time_of_day', 'cos_time_of_day']
 
         for column in self.df.columns[1:]:
             if column not in exclude_columns:
                 print(f"Обрабатываем колонку: {column}")
-                y1 = self.minmax_for_scaling_dict[column][0]
-                y2 = self.minmax_for_scaling_dict[column][1]
+                y1 = self.ranges_for_scaling_dict[column][0]
+                y2 = self.ranges_for_scaling_dict[column][1]
                 self.df[column] = ((2 * (self.df[column] - y1)) / (y2 - y1)) - 1
                 # Округляем числа
                 self.df[column] = round(self.df[column], 8)
         
-        print("\nНормировка данных в [-1, 1] успешно выполнена")
+        print("\nМасштабирование данных в [-1, 1] (с возможностью выхода")
+        print("за пределы этого диапазона) успешно выполнено")
         return self
 
     def _missing_values_check(self):
@@ -858,6 +851,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("ПРОВЕРКА NAN-ПРОПУСКОВ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
 
         missing = self.df.isna().sum()
         missing_total = missing.sum()
@@ -879,6 +876,10 @@ class PreprocessingPipeline:
         print("С НЕПРЕРЫВНЫМИ ПОМИНУТНЫМИ ДАННЫМИ")
         print("=" * 50)
 
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
         # Список длин отрезков (в часах)
         hours_list = [4, 6, 12, 24, 48]
 
@@ -892,6 +893,10 @@ class PreprocessingPipeline:
         print("\n" + "=" * 50)
         print("СОХРАНЕНИЕ ПРЕДОБРАБОТАННЫХ ДАННЫХ")
         print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст, нет данных для сохранения в файл")
+            return self
 
         self.df.to_csv(self.output_file_path, index=False)
 
@@ -1011,7 +1016,7 @@ class PreprocessingPipeline:
           ._fill_in_short_time_gaps()
           ._remove_consecutive_missing_values()
           ._fill_missing_values()
-          ._smooth_noisy_features()
+          ._smooth_pressure_and_temp_features()
           ._add_wind_forecast_column()
           ._compare_wind_speed_and_forecast()
           ._visualize_data()

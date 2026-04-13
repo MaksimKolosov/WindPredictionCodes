@@ -4,9 +4,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 from matplotlib.dates import DateFormatter
-from statsmodels.tsa.stattools import acf, pacf, adfuller, kpss
+from statsmodels.tsa.stattools import acf, pacf, adfuller
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from scipy.fft import fft, fftfreq
 
 
 class EDAPipeline:
@@ -541,189 +540,13 @@ class EDAPipeline:
 
         return self
 
-    def _analyze_synoptic_cyclicity(self):
-        # Анализ синоптической цикличности (3-14 дневные периоды)
-        # Выявление циклов, связанных с прохождением циклонов и антициклонов
-        print("\n" + "=" * 50)
-        print("АНАЛИЗ СИНОПТИЧЕСКОЙ ЦИКЛИЧНОСТИ (3-14 дней)")
-        print("=" * 50)
-        
-        numeric_columns = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        variable_columns = [col for col in numeric_columns if self.df[col].nunique() > 1]
-        
-        if not variable_columns:
-            print("Нет переменных признаков для анализа")
-            return self
-        
-        # Добавление временных признаков
-        df_analysis = self.df.copy()
-        df_analysis['date'] = pd.to_datetime(df_analysis['date'])
-        
-        # Определяем периоды для анализа (в днях)
-        target_periods_days = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-        print(f"Анализируемые периоды: {', '.join(map(str, target_periods_days))} дней")
-        
-        results = []
-        wind_speed_results = []  # отдельно для ветра
-        pressure_results = []    # отдельно для давления
-        
-        for col in variable_columns:
-            data = df_analysis[[col, 'date']].dropna()
-            
-            if len(data) < 14 * 24:
-                continue
-            
-            try:
-                # Агрегация данных
-                hourly_data = data.set_index('date')[col].resample('1H').mean()
-                daily_data = hourly_data.resample('1D').mean().dropna()
-                
-                if len(daily_data) < 28:
-                    continue
-                
-                # Спектральный анализ
-                n = len(daily_data)
-                fft_vals = fft(daily_data.values - daily_data.mean())
-                fft_freq = fftfreq(n, d=1)
-                
-                positive_freq = fft_freq[:n//2]
-                positive_fft = np.abs(fft_vals[:n//2])
-                positive_fft = positive_fft / np.max(positive_fft)
-                
-                periods_days = 1 / positive_freq
-                
-                # Анализ целевых периодов (FFT)
-                period_strengths = {}
-                for target_period in target_periods_days:
-                    mask = (periods_days >= target_period - 0.5) & (periods_days <= target_period + 0.5)
-                    if mask.any():
-                        strength = positive_fft[mask].max()
-                    else:
-                        strength = 0
-                    period_strengths[target_period] = strength
-                
-                # ACF анализ
-                acf_daily = acf(daily_data.values, nlags=min(30, len(daily_data)//3), fft=True)
-                significance = 2 / np.sqrt(len(daily_data))
-                
-                acf_strengths = {}
-                for target_period in target_periods_days:
-                    if target_period < len(acf_daily):
-                        acf_strengths[target_period] = abs(acf_daily[target_period])
-                    else:
-                        acf_strengths[target_period] = 0
-                
-                # Комбинированная оценка
-                combined_strengths = {}
-                for period in target_periods_days:
-                    combined = period_strengths[period] * 0.6 + acf_strengths[period] * 0.4
-                    combined_strengths[period] = combined
-                
-                # Доминирующий период
-                dominant_period = max(combined_strengths, key=combined_strengths.get)
-                dominant_strength = combined_strengths[dominant_period]
-                
-                # Классификация синоптической активности
-                total_strength = sum(combined_strengths.values())
-                
-                if total_strength > 4.0:
-                    synoptic_activity = "Экстремально высокая"
-                elif total_strength > 3.0:
-                    synoptic_activity = "Очень высокая"
-                elif total_strength > 2.0:
-                    synoptic_activity = "Высокая"
-                elif total_strength > 1.2:
-                    synoptic_activity = "Умеренная"
-                elif total_strength > 0.6:
-                    synoptic_activity = "Слабая"
-                else:
-                    synoptic_activity = "Отсутствует"
-                
-                # Сохранение результатов
-                result = {
-                    'Признак': col,
-                    'Синоптическая активность': synoptic_activity,
-                    'Доминирующий период (дни)': dominant_period,
-                    'Сила доминирующего периода': round(dominant_strength, 3)
-                }
-                
-                results.append(result)
-                
-                # Отдельно сохраняем для ветра и давления
-                if 'wind_speed' in col.lower() or 'скорость ветра' in col.lower():
-                    wind_speed_results.append(result)
-                if 'pressure' in col.lower() or 'давление' in col.lower():
-                    pressure_results.append(result)
-                
-            except Exception as e:
-                continue
-        
-        # ========== Сводка результатов ==========
-        if not results:
-            print("\nНедостаточно данных для анализа (требуется минимум 28 дней наблюдений)")
-            return self
-        
-        results_df = pd.DataFrame(results)
-        
-        print("\n" + "="*80)
-        print("СВОДКА АНАЛИЗА СИНОПТИЧЕСКОЙ ЦИКЛИЧНОСТИ")
-        print("="*80)
-        
-        # Основная таблица
-        display_cols = ['Признак', 'Синоптическая активность', 'Доминирующий период (дни)', 'Сила доминирующего периода']
-        print(results_df[display_cols].to_string(index=False))
-        
-        # ========== ОПРЕДЕЛЕНИЕ ОСНОВНОГО ПЕРИОДА ==========
-        print("\n" + "="*80)
-        print("ОПРЕДЕЛЕНИЕ ОСНОВНОГО СИНОПТИЧЕСКОГО ПЕРИОДА")
-        print("="*80)
-        
-        # Приоритет 1: признаки скорости ветра
-        if wind_speed_results:
-            wind_df = pd.DataFrame(wind_speed_results)
-            # Берем медиану или моду? Используем среднее, взвешенное по силе
-            weighted_period = np.average(wind_df['Доминирующий период (дни)'], 
-                                          weights=wind_df['Сила доминирующего периода'])
-            main_period = round(weighted_period)
-            period_source = "скорости ветра"
-            print(f"\nОпределение по признакам скорости ветра:")
-            for _, row in wind_df.iterrows():
-                print(f"   • {row['Признак']}: период {row['Доминирующий период (дни)']} дней, сила {row['Сила доминирующего периода']}")
-            print(f"\n   → Взвешенный период: {main_period} дней")
-        
-        # Приоритет 2: признаки давления (если нет ветра)
-        elif pressure_results:
-            pressure_df = pd.DataFrame(pressure_results)
-            weighted_period = np.average(pressure_df['Доминирующий период (дни)'], 
-                                          weights=pressure_df['Сила доминирующего периода'])
-            main_period = round(weighted_period)
-            period_source = "атмосферного давления"
-            print(f"\nОпределение по признакам давления:")
-            for _, row in pressure_df.iterrows():
-                print(f"   • {row['Признак']}: период {row['Доминирующий период (дни)']} дней, сила {row['Сила доминирующего периода']}")
-            print(f"\n   → Взвешенный период: {main_period} дней")
-        
-        # Приоритет 3: все признаки
-        else:
-            weighted_period = np.average(results_df['Доминирующий период (дни)'], 
-                                          weights=results_df['Сила доминирующего периода'])
-            main_period = round(weighted_period)
-            period_source = "всех признаков"
-            print(f"\nОпределение по всем признакам:")
-            print(f"   → Взвешенный период: {main_period} дней")
-        
-        print(f"\nВЫВОД:")
-        print(f"   • Основной синоптический период: {main_period} дней")
-        print(f"   • Источник определения: {period_source}")
-        print(f"   • Целесообразно формировать последовательности длиной не менее синоптического периода для обучения моделей")
-        
-        return self
-
     def _stationarity_check(self):
         # Проверка стационарности
         print("\n" + "=" * 50)
         print("ПРОВЕРКА СТАЦИОНАРНОСТИ ВРЕМЕННЫХ РЯДОВ")
         print("=" * 50)
+        
+        max_points = 5000
         
         for col in self.df.select_dtypes(include=[np.number]).columns:
             if self.df[col].nunique() <= 1:
@@ -732,13 +555,163 @@ class EDAPipeline:
             data = self.df[col].dropna()
             if len(data) < 100:
                 continue
-                
-            # ADF тест
-            adf_result = adfuller(data, autolag='AIC')
+            
+            # Сэмплирование для больших данных
+            if len(data) > max_points:
+                idx = np.linspace(0, len(data)-1, max_points, dtype=int)
+                data = data.iloc[idx]
+            
+            # Ограничиваем максимальный лаг
+            maxlag = min(30, len(data) // 10)
+            adf_result = adfuller(data, autolag='AIC', maxlag=maxlag)
             is_stationary = adf_result[1] < 0.05
             
             status = "Стационарный" if is_stationary else "Нестационарный"
             print(f"{col}: {status}")
+        
+        return self
+
+    def _estimate_optimal_lookback(self):
+        # Оценка оптимальной длины исторического окна (lookback window) на основе ACF/PACF
+        print("\n" + "=" * 50)
+        print("ОЦЕНКА ОПТИМАЛЬНОГО ИСТОРИЧЕСКОГО ОКНА (LOOKBACK)")
+        print("=" * 50)
+        
+        # Исключаем временные признаки
+        exclude_columns = ['date', 'sin_time_of_day', 'cos_time_of_day']
+        
+        # Все числовые признаки
+        all_columns = [col for col in self.df.select_dtypes(include=[np.number]).columns 
+                       if col not in exclude_columns]
+        
+        if not all_columns:
+            print("Не найдено признаков для анализа")
+            return self
+        
+        # Ограничение на количество точек для анализа
+        MAX_POINTS = 5000
+        MAX_LAGS = 200  # Максимальное количество лагов для ACF/PACF
+        
+        print(f"\nАнализируемые признаки:")
+        print("-" * 85)
+        print(f"{'Признак':<35} {'30 мин':<10} {'1 час':<10} {'2 часа':<10} {'3 часа':<10}")
+        print("-" * 85)
+        
+        all_lookbacks_30min = []
+        all_lookbacks_1h = []
+        all_lookbacks_2h = []
+        all_lookbacks_3h = []
+        
+        for col in all_columns:
+            data = self.df[col].dropna()
+            
+            if len(data) < 144:
+                print(f"{col:<35} {'недостаточно данных':<42}")
+                continue
+            
+            # Сэмплирование для больших данных
+            if len(data) > MAX_POINTS:
+                idx = np.linspace(0, len(data)-1, MAX_POINTS, dtype=int)
+                data = data.iloc[idx]
+            
+            # Уменьшаем количество лагов для ACF/PACF
+            nlags = min(MAX_LAGS, len(data) // 3)
+            
+            # Используем fft только для больших данных
+            use_fft = len(data) > 1000
+            acf_values = acf(data, nlags=nlags, fft=use_fft)
+            
+            # PACF считаем только с ограниченным числом лагов
+            pacf_values = pacf(data, nlags=min(nlags, 50))
+            
+            significance_threshold = 2 / np.sqrt(len(data))
+            
+            # Объединяем поиск в один проход
+            decay_lag_02 = None
+            zero_crossing = None
+            decay_lag_368 = None
+            
+            for lag in range(1, min(len(acf_values), MAX_LAGS)):
+                abs_val = abs(acf_values[lag])
+                
+                # Затухание до 0.2
+                if decay_lag_02 is None and abs_val < 0.2:
+                    decay_lag_02 = lag
+                
+                # Затухание до 0.368
+                if decay_lag_368 is None and abs_val < 0.368:
+                    decay_lag_368 = lag
+                
+                # Переход через ноль
+                if zero_crossing is None and lag > 0 and acf_values[lag] * acf_values[lag-1] < 0:
+                    zero_crossing = lag
+                
+                # Ранний выход, если нашли всё
+                if decay_lag_02 and zero_crossing and decay_lag_368:
+                    break
+            
+            # PACF порядок за один проход
+            pacf_order = 0
+            for lag in range(1, min(len(pacf_values), 50)):
+                if abs(pacf_values[lag]) > significance_threshold:
+                    pacf_order = lag
+            
+            # Комбинированная оценка
+            estimates = []
+            if decay_lag_02:
+                estimates.append(decay_lag_02)
+            if zero_crossing:
+                estimates.append(zero_crossing)
+            if decay_lag_368:
+                estimates.append(decay_lag_368)
+            if pacf_order > 0:
+                estimates.append(pacf_order * 2)
+            
+            if estimates:
+                char_length = int(np.median(estimates))
+            else:
+                char_length = 60
+            
+            char_length = max(30, min(char_length, 360))
+            
+            # Расчёт lookback (упрощённая формула)
+            # Оптимизация 7: Упрощаем расчёт lookback
+            if char_length < 60:
+                multiplier = 1
+            elif char_length < 120:
+                multiplier = 1
+            else:
+                multiplier = 0.5
+            
+            lookback_30min = max(30, min(int(char_length * (0.5 + multiplier * 0.5)), 240))
+            lookback_1h = max(60, min(int(char_length * (1 + multiplier)), 480))
+            lookback_2h = max(90, min(int(char_length * (2 + multiplier)), 720))
+            lookback_3h = max(120, min(int(char_length * (3 + multiplier)), 1440))
+            
+            all_lookbacks_30min.append(lookback_30min)
+            all_lookbacks_1h.append(lookback_1h)
+            all_lookbacks_2h.append(lookback_2h)
+            all_lookbacks_3h.append(lookback_3h)
+            
+            print(f"{col:<35} {lookback_30min:<10} {lookback_1h:<10} {lookback_2h:<10} {lookback_3h:<10}")
+        
+        # ИТОГОВЫЕ РЕКОМЕНДАЦИИ
+        if all_lookbacks_30min:
+            recommended_30min = int(np.percentile(all_lookbacks_30min, 90))
+            recommended_1h = int(np.percentile(all_lookbacks_1h, 90))
+            recommended_2h = int(np.percentile(all_lookbacks_2h, 90))
+            recommended_3h = int(np.percentile(all_lookbacks_3h, 90))
+            
+            print("\nРекомендации по выбору lookback window:")
+            print("-"*60)
+            print(f"\n{'Горизонт':<12} {'LSTM/GRU':<25} {'Transformer':<25}")
+            print("-" * 62)
+            print(f"{'30 мин':<12} {recommended_30min} мин ({recommended_30min/60:.1f} ч){'':<6} {min(recommended_30min*2, 480)} мин ({min(recommended_30min*2, 480)/60:.1f} ч)")
+            print(f"{'1 час':<12} {recommended_1h} мин ({recommended_1h/60:.1f} ч){'':<6} {min(recommended_1h*2, 720)} мин ({min(recommended_1h*2, 720)/60:.1f} ч)")
+            print(f"{'2 часа':<12} {recommended_2h} мин ({recommended_2h/60:.1f} ч){'':<6} {min(recommended_2h*2, 1440)} мин ({min(recommended_2h*2, 1440)/60:.1f} ч)")
+            print(f"{'3 часа':<12} {recommended_3h} мин ({recommended_3h/60:.1f} ч){'':<6} {min(recommended_3h*2, 2880)} мин ({min(recommended_3h*2, 2880)/60:.1f} ч)")
+            
+            print("\n" + "="*60)
         
         return self
 
@@ -757,8 +730,8 @@ class EDAPipeline:
           ._correlation_analysis()
           ._time_series_autocorrelation()
           ._analyze_daily_seasonality()
-          ._analyze_synoptic_cyclicity()
           ._stationarity_check()
+          ._estimate_optimal_lookback()
         )
 
         print("\n***** EDA-PIPELINE УСПЕШНО ЗАВЕРШЁН! *****\n")
