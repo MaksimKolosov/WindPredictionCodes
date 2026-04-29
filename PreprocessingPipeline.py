@@ -17,17 +17,15 @@ class PreprocessingPipeline:
         self.output_file_path = output_file_path
         self.df = None
         self.physical_limits_tomsk_dict = {"air_temperature": [-55, 38], "wind_speed_horizontal": [0, 32],
-                                          "wind_direction": [0, 360], "wind_speed_min": [0, 32],
-                                          "wind_speed_max": [0, 32], "wind_speed_vertical": [-40, 40],
-                                          "atmospheric_pressure": [710, 805], "relative_humidity": [10, 100],
-                                          "dew_point_temperature": [-50, 24], "pressure_derivative": [-0.00038, 0.00038],
-                                          "wind_forecast_three_hours": [0, 32], "day_of_year": [0, 366]}
+                                          "wind_speed_min": [0, 32], "wind_speed_max": [0, 32],
+                                          "wind_speed_vertical": [-40, 40], "atmospheric_pressure": [710, 805],
+                                          "relative_humidity": [10, 100], "dew_point_temperature": [-50, 24],
+                                          "pressure_derivative": [-0.00038, 0.00038], "wind_forecast_three_hours": [0, 32]}
         self.ranges_for_scaling_dict = {"air_temperature": [-30, 30], "wind_speed_horizontal": [0, 25],
-                                          "wind_direction": [0, 360], "wind_speed_min": [0, 25],
-                                          "wind_speed_max": [0, 25], "wind_speed_vertical": [-25, 25],
-                                          "atmospheric_pressure": [730, 780], "relative_humidity": [30, 100],
-                                          "dew_point_temperature": [-30, 30], "pressure_derivative": [-0.00026, 0.00026],
-                                          "wind_forecast_three_hours": [0, 25], "day_of_year": [0, 366]}
+                                          "wind_speed_min": [0, 25], "wind_speed_max": [0, 25],
+                                          "wind_speed_vertical": [-25, 25], "atmospheric_pressure": [730, 780],
+                                          "relative_humidity": [30, 100], "dew_point_temperature": [-30, 30],
+                                          "pressure_derivative": [-0.00026, 0.00026], "wind_forecast_three_hours": [0, 25]}
         self.time_threshold_for_gaps = 15
 
     def _load_data(self):
@@ -71,7 +69,7 @@ class PreprocessingPipeline:
             self.df = self.df[self.df['date'].dt.year >= 2022]
             print("Данные старше 2022 года удалены")
         else:
-            print("В датасете нет старых данных, удалять ничего не нужно")
+            print("В датасете нет данных старше 2022 года, удалять ничего не нужно")
         
         return self
 
@@ -96,26 +94,9 @@ class PreprocessingPipeline:
 
         return self
 
-    def _remove_unnecessary_features(self):
+    def _add_day_of_year_features(self):
         print("\n" + "=" * 50)
-        print("УДАЛЕНИЕ НЕНУЖНЫХ ПРИЗНАКОВ")
-        print("=" * 50)
-
-        if len(self.df) == 0:
-            print("Датасет пуст")
-            return self
-
-        # Удаляем признаки (малоинформативные или сильно коррелирующие с другими признаками)
-        features_to_drop = ['vapor_pressure', 'absolute_humidity', 'air_density', 
-                            'speed_of_sound', 'CFSv2_temperature', 'cloud_mixing']
-        self.df = self.df.drop(features_to_drop, axis=1)
-
-        print(f"Удалены признаки:\n{", ".join(features_to_drop)}")
-        return self
-
-    def _add_day_of_year_feature(self):
-        print("\n" + "=" * 50)
-        print("ДОБАВЛЕНИЕ ПРИЗНАКА ДНЯ ГОДА")
+        print("ДОБАВЛЕНИЕ ПРИЗНАКОВ ДНЯ ГОДА")
         print("=" * 50)
 
         if len(self.df) == 0:
@@ -123,9 +104,35 @@ class PreprocessingPipeline:
             return self
 
         # День года (1-365/366)
-        self.df['day_of_year'] = self.df['date'].dt.dayofyear
+        day_of_year = self.df['date'].dt.dayofyear
+
+        # Признаки синуса и косинуса дня года
+        self.df['sin_day_of_year'] = np.sin(2 * np.pi * day_of_year / 365.25)
+        self.df['cos_day_of_year'] = np.cos(2 * np.pi * day_of_year / 365.25)
         
-        print("Добавлен признак: day_of_year")
+        print("Добавлены признаки: sin_day_of_year, cos_day_of_year")
+        
+        return self
+
+    def _add_cyclic_wind_direction_features(self):
+        print("\n" + "=" * 50)
+        print("ЦИКЛИЧЕСКОЕ ПРЕОБРАЗОВАНИЕ НАПРАВЛЕНИЯ ВЕТРА")
+        print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+        
+        if 'wind_direction' not in self.df.columns:
+            print("Колонка 'wind_direction' не найдена")
+            return self
+        
+        # Перевод градусов в радианы
+        wd_rad = np.deg2rad(self.df['wind_direction'])
+        self.df['sin_wind_direction'] = np.sin(wd_rad)
+        self.df['cos_wind_direction'] = np.cos(wd_rad)
+        
+        print("Добавлены признаки: sin_wind_direction, cos_wind_direction")
         
         return self
 
@@ -177,6 +184,23 @@ class PreprocessingPipeline:
         
         return self
 
+    def _remove_unnecessary_features(self):
+        print("\n" + "=" * 50)
+        print("УДАЛЕНИЕ НЕНУЖНЫХ ПРИЗНАКОВ")
+        print("=" * 50)
+
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+
+        # Удаляем признаки (малоинформативные или сильно коррелирующие с другими признаками)
+        features_to_drop = ['vapor_pressure', 'absolute_humidity', 'air_density', 
+                            'speed_of_sound', 'CFSv2_temperature', 'cloud_mixing', 'wind_direction']
+        self.df = self.df.drop(features_to_drop, axis=1)
+
+        print(f"Удалены признаки:\n{", ".join(features_to_drop)}")
+        return self
+
     def _remove_outliers(self):
         # Устранение выбросов и аномалий
         print("\n" + "=" * 50)
@@ -188,7 +212,8 @@ class PreprocessingPipeline:
             return self
         
         numerical_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        exclude_cols = ['sin_time_of_day', 'cos_time_of_day', 'day_of_year']
+        exclude_cols = ['sin_time_of_day', 'cos_time_of_day', 'sin_day_of_year', 'cos_day_of_year',
+                       'sin_wind_direction', 'cos_wind_direction']
         
         total_removed = 0
         
@@ -429,11 +454,11 @@ class PreprocessingPipeline:
             self.df.loc[mask, 'cos_time_of_day'] = np.cos((2 * np.pi * minutes_since_epoch) / 1440)
 
         # Устанавливаем единый порядок колонок
-        self.df = self.df[['date', 'day_of_year', 'air_temperature', 'wind_speed_horizontal', 
-                           'wind_direction', 'wind_speed_min', 'wind_speed_max', 
+        self.df = self.df[['date', 'air_temperature', 'wind_speed_horizontal', 
+                           'sin_wind_direction', 'cos_wind_direction', 'wind_speed_min', 'wind_speed_max', 
                            'wind_speed_vertical', 'atmospheric_pressure', 'pressure_derivative', 
                            'relative_humidity', 'dew_point_temperature', 
-                           'sin_time_of_day', 'cos_time_of_day']]
+                           'sin_time_of_day', 'cos_time_of_day', 'sin_day_of_year', 'cos_day_of_year']]
 
         # Заполняем пропуски с помощью интерполяции по времени
         df_temp = self.df.set_index('date')
@@ -505,8 +530,69 @@ class PreprocessingPipeline:
             print(f"   → Сглаживание (окно {config['window']} мин)")
             print(f"   → Снижение шума: {noise_reduction:.1f}%")
         
-        print(f"\nСглаживание завершено")
+        print(f"\nСглаживание признаков давления и температуры завершено")
         
+        return self
+
+    def _remove_high_freq_noise_from_wind_speed_features(self):
+        print("\n" + "=" * 50)
+        print("УДАЛЕНИЕ ВЫСОКОЧАСТОТНЫХ ШУМОВ")
+        print("ИЗ ПРИЗНАКОВ СКОРОСТИ ВЕТРА")
+        print("=" * 50)
+    
+        if len(self.df) == 0:
+            print("Датасет пуст")
+            return self
+    
+        # Конфигурация: окно сглаживания (минуты), округление, порог шума
+        smooth_config = {
+            'wind_speed_horizontal': {'window': 3, 'rounding': 2, 'noise_threshold': 0.15},
+            'wind_speed_vertical':   {'window': 3, 'rounding': 2, 'noise_threshold': 0.10},
+            'wind_speed_min':        {'window': 3, 'rounding': 2, 'noise_threshold': 0.15},
+            'wind_speed_max':        {'window': 3, 'rounding': 2, 'noise_threshold': 0.15},
+        }
+    
+        columns_to_smooth = [col for col in smooth_config if col in self.df.columns]
+        if not columns_to_smooth:
+            print("Не найдено ветровых признаков для сглаживания")
+            return self
+    
+        # Работаем с копией для временного индекса
+        df_temp = self.df.copy()
+        df_temp['date'] = pd.to_datetime(df_temp['date'])
+        df_temp = df_temp.set_index('date').sort_index()
+    
+        for col in columns_to_smooth:
+            cfg = smooth_config[col]
+            series = df_temp[col].dropna()
+            if len(series) < 100:
+                print(f"\n{col}: недостаточно данных, сглаживание пропущено")
+                continue
+    
+            # Оценка уровня шума (медиана абсолютных первых разностей)
+            noise_level = series.diff().abs().median()
+            if noise_level < cfg['noise_threshold']:
+                print(f"\n{col}: уровень шума {noise_level:.3f} < порога {cfg['noise_threshold']}, сглаживание не требуется")
+                continue
+    
+            original_series = self.df[col].copy()
+            window = cfg['window']
+            # Медианное сглаживание с центрированием
+            smoothed = series.rolling(window=window, center=True, min_periods=2).median()
+    
+            updated = 0
+            for idx, val in smoothed.items():
+                if not pd.isna(val):
+                    self.df.loc[self.df['date'] == idx, col] = round(val, cfg['rounding'])
+                    updated += 1
+    
+            # Оценка снижения шума
+            original_diff = original_series.diff().abs().median()
+            after_diff = self.df[col].diff().abs().median()
+            reduction = (1 - after_diff / original_diff) * 100 if original_diff > 0 else 0
+            print(f"\n{col}: окно {window} мин, шум {noise_level:.3f} → сглажено {updated} точек, снижение шума {reduction:.1f}%")
+    
+        print("\nУдаление высокочастотных шумов из признаков скорости ветра завершено")
         return self
 
     def _add_wind_forecast_column(self):
@@ -831,7 +917,8 @@ class PreprocessingPipeline:
             return self
 
         # Столбцы для исключения
-        exclude_columns = ['date', 'sin_time_of_day', 'cos_time_of_day']
+        exclude_columns = ['date', 'sin_time_of_day', 'cos_time_of_day', 'sin_day_of_year', 'cos_day_of_year',
+                          'sin_wind_direction', 'cos_wind_direction']
 
         for column in self.df.columns[1:]:
             if column not in exclude_columns:
@@ -881,7 +968,7 @@ class PreprocessingPipeline:
             return self
 
         # Список длин отрезков (в часах)
-        hours_list = [4, 6, 12, 24, 48]
+        hours_list = [6, 12, 24]
 
         for hours in hours_list:
             total_segments = self.__count_continuous_segments(hours)
@@ -1009,14 +1096,16 @@ class PreprocessingPipeline:
           ._modify_date_column()
           ._delete_old_data()
           ._delete_duplicates()
-          ._remove_unnecessary_features()
-          ._add_day_of_year_feature()
+          ._add_day_of_year_features()
+          ._add_cyclic_wind_direction_features()
           ._add_pressure_derivative()
+          ._remove_unnecessary_features()
           ._remove_outliers()
           ._fill_in_short_time_gaps()
           ._remove_consecutive_missing_values()
           ._fill_missing_values()
           ._smooth_pressure_and_temp_features()
+          ._remove_high_freq_noise_from_wind_speed_features()
           ._add_wind_forecast_column()
           ._compare_wind_speed_and_forecast()
           ._visualize_data()
@@ -1027,3 +1116,40 @@ class PreprocessingPipeline:
         )
 
         print("\n***** PREPROCESSING-PIPELINE УСПЕШНО ЗАВЕРШЁН! *****\n")
+
+
+# Пример использования
+if __name__ == "__main__":
+    # Создание папки ../../../preprocessed_dataweather, и вложенных в неё папок
+    folder_pp_dataweather = "../../../preprocessed_dataweather"
+    if not os.path.exists(folder_pp_dataweather):
+        os.mkdir(folder_pp_dataweather)
+    folder_one_min = "../../../preprocessed_dataweather/1min"
+    if not os.path.exists(folder_one_min):
+        os.mkdir(folder_one_min)
+    folder_summer = "../../../preprocessed_dataweather/1min/summer"
+    if not os.path.exists(folder_summer):
+        os.mkdir(folder_summer)
+    folder_autumn = "../../../preprocessed_dataweather/1min/autumn"
+    if not os.path.exists(folder_autumn):
+        os.mkdir(folder_autumn)
+    folder_winter = "../../../preprocessed_dataweather/1min/winter"
+    if not os.path.exists(folder_winter):
+        os.mkdir(folder_winter)
+    folder_spring = "../../../preprocessed_dataweather/1min/spring"
+    if not os.path.exists(folder_spring):
+        os.mkdir(folder_spring)
+    
+    # Предобработка
+    folder_base = "../../../dataweather/1min"
+    folder_pp_base = "../../../preprocessed_dataweather/1min"
+    
+    for root, dirs, files in os.walk(folder_base):
+        for file in files:
+            if 'oblkom_26m.csv' in file or 'oblkom_27m.csv' in file:
+                input_file_path = os.path.join(root, file)
+                rel_path = os.path.relpath(root, folder_base)
+                output_dir = os.path.join(folder_pp_base, rel_path)
+                output_file_path = os.path.join(output_dir, file)
+                preprocessing_pipeline = PreprocessingPipeline(input_file_path, output_file_path)
+                preprocessing_pipeline.run_preprocessing_pipeline()

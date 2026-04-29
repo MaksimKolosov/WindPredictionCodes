@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -735,3 +737,19 @@ class EDAPipeline:
         )
 
         print("\n***** EDA-PIPELINE УСПЕШНО ЗАВЕРШЁН! *****\n")
+
+
+# Пример использования
+if __name__ == "__main__":
+    files_path = "../../../dataweather/1min"
+
+    if not os.path.exists(files_path):
+        print(f"Директория {files_path} не существует!")
+    else:
+        path = Path(files_path)
+        
+        for file_path in path.rglob('*'):
+            if file_path.name == 'oblkom_26m.csv' or file_path.name == 'oblkom_27m.csv':
+                station_file_path = str(file_path)
+                eda_pipeline = EDAPipeline(station_file_path)
+                eda_pipeline.run_eda_pipeline()
