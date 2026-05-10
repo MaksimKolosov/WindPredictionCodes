@@ -6,12 +6,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 from scipy.stats import ttest_rel
 import os
 import gc
 from glob import glob
+from math import radians, sin, cos, sqrt, atan2
 
 # Проверка CUDA
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -25,6 +25,32 @@ torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
+# ==================== ФУНКЦИИ ДЛЯ РАСЧЁТА РАССТОЯНИЙ В МЕТРАХ ====================
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Вычисление расстояния между двумя точками на сфере (в метрах)"""
+    R = 6371000
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return R * c
+
+def find_nearest_station_meters(target_station, station_coords, all_stations):
+    """Находит БЛИЖАЙШУЮ станцию к целевой (расстояние в метрах)"""
+    target_lat, target_lon = station_coords[target_station]
+    nearest_station = None
+    min_distance = float('inf')
+    for station in all_stations:
+        if station != target_station:
+            lat, lon = station_coords[station]
+            dist = haversine_distance(target_lat, target_lon, lat, lon)
+            if dist < min_distance:
+                min_distance = dist
+                nearest_station = station
+    return nearest_station, min_distance
+
 # ==================== ПАРАМЕТРЫ МАСШТАБИРОВАНИЯ ====================
 WIND_HOR_MIN = 0.0
 WIND_HOR_MAX = 25.0
@@ -32,24 +58,19 @@ WIND_VER_MIN = -25.0
 WIND_VER_MAX = 25.0
 
 def scale_horizontal_to_original(scaled_values):
-    """Преобразование горизонтальной скорости из [-1, 1] в [0, 25] м/с"""
     return (scaled_values + 1) / 2 * (WIND_HOR_MAX - WIND_HOR_MIN) + WIND_HOR_MIN
 
 def scale_vertical_to_original(scaled_values):
-    """Преобразование вертикальной скорости из [-1, 1] в [-25, 25] м/с"""
     return (scaled_values + 1) / 2 * (WIND_VER_MAX - WIND_VER_MIN) + WIND_VER_MIN
 
 def scale_horizontal_to_normalized(original_values):
-    """Преобразование горизонтальной скорости из [0, 25] в [-1, 1]"""
     return (original_values - WIND_HOR_MIN) / (WIND_HOR_MAX - WIND_HOR_MIN) * 2 - 1
 
 def scale_vertical_to_normalized(original_values):
-    """Преобразование вертикальной скорости из [-25, 25] в [-1, 1]"""
     return (original_values - WIND_VER_MIN) / (WIND_VER_MAX - WIND_VER_MIN) * 2 - 1
 
 # ==================== ПРИВЕДЕНИЕ ВЕТРА К ВЫСОТЕ ====================
 def wind_speed_to_height(wind_speed, from_height, to_height, alpha=0.2):
-    """Приведение скорости ветра к другой высоте по степенному закону"""
     from_height = float(from_height)
     to_height = float(to_height)
     if from_height == to_height:
@@ -59,15 +80,12 @@ def wind_speed_to_height(wind_speed, from_height, to_height, alpha=0.2):
 # ==================== 1. ЗАГРУЗКА ДАННЫХ ====================
 
 def load_multiple_csv_files(file_patterns, station_name, station_height, target_height=10.0):
-    """Загрузка данных из нескольких CSV файлов для одной станции"""
     all_dfs = []
-
     for pattern in file_patterns:
         if '*' in pattern or '?' in pattern:
             files = glob(pattern)
         else:
             files = [pattern] if os.path.exists(pattern) else []
-
         for file_path in files:
             print(f"    Загрузка файла: {os.path.basename(file_path)}")
             df = pd.read_csv(file_path)
@@ -75,7 +93,7 @@ def load_multiple_csv_files(file_patterns, station_name, station_height, target_
             all_dfs.append(df)
 
     if not all_dfs:
-        raise ValueError(f"Не найдено файлов для станции {station_name} по паттернам: {file_patterns}")
+        raise ValueError(f"Не найдено файлов для станции {station_name}")
 
     combined_df = pd.concat(all_dfs, ignore_index=True)
     combined_df = combined_df.sort_values('date').reset_index(drop=True)
@@ -92,7 +110,7 @@ def load_multiple_csv_files(file_patterns, station_name, station_height, target_
     wind_ver_original = scale_vertical_to_original(wind_ver_scaled)
     wind_ver_corrected_scaled = wind_ver_scaled
 
-    print(f"    Всего записей после объединения: {len(combined_df)}")
+    print(f"    Всего записей: {len(combined_df)}")
     print(f"    Диапазон дат: {combined_df['date'].min()} - {combined_df['date'].max()}")
 
     return {
@@ -108,120 +126,82 @@ def load_multiple_csv_files(file_patterns, station_name, station_height, target_
         'height': station_height
     }
 
-def align_stations_data(stations_dict, lookback=24, forecast_horizon=3, component='horizontal'):
-    """Выравнивание данных по времени для выбранной компоненты ветра"""
-    common_timestamps = None
-    for station_name, station_data in stations_dict.items():
-        timestamps_set = set(station_data['timestamps'])
-        if common_timestamps is None:
-            common_timestamps = timestamps_set
-        else:
-            common_timestamps = common_timestamps.intersection(timestamps_set)
-
-    common_timestamps = sorted(list(common_timestamps))
-    print(f"Найдено общих временных меток: {len(common_timestamps)}")
-
-    aligned_data = {}
-    for station_name, station_data in stations_dict.items():
-        if component == 'horizontal':
-            wind_scaled = station_data['wind_hor_corrected_scaled']
-        else:
-            wind_scaled = station_data['wind_ver_scaled']
-
-        timestamp_to_value = dict(zip(station_data['timestamps'], wind_scaled))
-        aligned_values = np.array([timestamp_to_value.get(ts, np.nan) for ts in common_timestamps])
-
-        aligned_data[station_name] = {
-            'timestamps': common_timestamps,
-            'wind_speed_scaled': aligned_values,
-            'name': station_name,
-            'height': station_data['height']
-        }
-
-    return aligned_data
-
-def create_continuous_sequences(data_dict, lookback=24, forecast_horizon=3, stride=10):
+def create_sequences_from_single_station(station_data, lookback_minutes=360, forecast_minutes=180,
+                                         stride_minutes=60, component='horizontal'):
     """
-    Создание непрерывных последовательностей с разрежением
+    Создание последовательностей для ОДНОЙ станции.
 
-    stride: шаг между последовательностями (1 - все, 10 - каждую 10-ю)
+    Параметры:
+        lookback_minutes: история в минутах (по умолчанию 360 минут = 6 часов)
+        forecast_minutes: прогноз в минутах (по умолчанию 180 минут = 3 часа)
+        stride_minutes: шаг между примерами в минутах (по умолчанию 60 минут = 1 час)
+        component: 'horizontal' или 'vertical'
+
+    ВНИМАНИЕ: Данные поминутные, поэтому lookback, forecast, stride - это минуты.
     """
-    sequences = {station: {'X': [], 'y': [], 'timestamps': []} for station in data_dict}
+    if component == 'horizontal':
+        wind_speed = station_data['wind_hor_corrected_scaled']
+    else:
+        wind_speed = station_data['wind_ver_scaled']
 
-    for station_name, station_data in data_dict.items():
-        wind_speed = station_data['wind_speed_scaled']
-        timestamps = station_data['timestamps']
+    timestamps = station_data['timestamps']
 
-        continuous_segments = []
-        current_segment = []
-        current_timestamps = []
+    # Преобразуем минуты в шаги (1 шаг = 1 минута)
+    lookback_steps = lookback_minutes
+    forecast_steps = forecast_minutes
+    stride_steps = stride_minutes
 
-        for i, (ws, ts) in enumerate(zip(wind_speed, timestamps)):
-            if pd.isna(ws):
-                if len(current_segment) >= lookback + forecast_horizon:
-                    continuous_segments.append((current_segment, current_timestamps))
-                current_segment = []
-                current_timestamps = []
-            else:
-                current_segment.append(ws)
-                current_timestamps.append(ts)
+    print(f"    Параметры: lookback={lookback_steps} мин ({lookback_steps/60:.1f} ч), "
+          f"forecast={forecast_steps} мин ({forecast_steps/60:.1f} ч), "
+          f"stride={stride_steps} мин ({stride_steps/60:.1f} ч)")
 
-        if len(current_segment) >= lookback + forecast_horizon:
-            continuous_segments.append((current_segment, current_timestamps))
+    # Находим непрерывные сегменты
+    continuous_segments = []
+    current_segment = []
+    current_timestamps = []
 
-        print(f"{station_name}: найдено {len(continuous_segments)} непрерывных сегментов")
+    for i, (ws, ts) in enumerate(zip(wind_speed, timestamps)):
+        if pd.isna(ws):
+            if len(current_segment) >= lookback_steps + forecast_steps:
+                continuous_segments.append((current_segment, current_timestamps))
+            current_segment = []
+            current_timestamps = []
+        else:
+            current_segment.append(ws)
+            current_timestamps.append(ts)
 
-        # Используем шаг stride для разрежения
-        total_before = 0
-        for segment, segment_ts in continuous_segments:
-            n_possible = len(segment) - lookback - forecast_horizon + 1
-            total_before += n_possible
-            for i in range(0, n_possible, stride):
-                X_seq = segment[i:i+lookback]
-                y_seq = segment[i+lookback:i+lookback+forecast_horizon]
-                ts_seq = segment_ts[i+lookback:i+lookback+forecast_horizon]
+    if len(current_segment) >= lookback_steps + forecast_steps:
+        continuous_segments.append((current_segment, current_timestamps))
 
-                sequences[station_name]['X'].append(X_seq)
-                sequences[station_name]['y'].append(y_seq)
-                sequences[station_name]['timestamps'].append(ts_seq)
+    print(f"    Найдено {len(continuous_segments)} непрерывных сегментов")
 
-        sequences[station_name]['X'] = np.array(sequences[station_name]['X'])
-        sequences[station_name]['y'] = np.array(sequences[station_name]['y'])
-        print(f"  До разрежения: {total_before} последовательностей")
-        print(f"  После разрежения (stride={stride}): {len(sequences[station_name]['X'])} последовательностей")
+    X = []
+    y = []
+    ts_list = []
 
-    return sequences
+    for segment, segment_ts in continuous_segments:
+        n_possible = len(segment) - lookback_steps - forecast_steps + 1
+        for i in range(0, n_possible, stride_steps):
+            X_seq = segment[i:i+lookback_steps]
+            # Предсказываем значение через forecast_steps минут
+            y_val = segment[i + lookback_steps + forecast_steps - 1]
+            ts_val = segment_ts[i + lookback_steps + forecast_steps - 1]
 
-# ==================== IDW ИНТЕРПОЛЯЦИЯ ====================
+            X.append(X_seq)
+            y.append(y_val)
+            ts_list.append(ts_val)
 
-def idw_interpolation(target_coord, source_coords, source_values, power=2):
-    """IDW интерполяция"""
-    distances = np.sqrt(((source_coords - target_coord) ** 2).sum(axis=1))
-    distances = np.maximum(distances, 1e-10)
-    weights = 1.0 / (distances ** power)
-    weights = weights / weights.sum()
-    return np.sum(source_values * weights, axis=0)
+    X = np.array(X)
+    y = np.array(y).reshape(-1, 1)
+    print(f"    Создано {len(X)} последовательностей (прогноз на {forecast_minutes} мин = {forecast_minutes/60:.1f} ч)")
 
-def idw_predict_sequence(target_coord, source_coords_dict, sequences, test_indices):
-    """IDW прогноз на последовательность времени"""
-    predictions = []
-    source_stations = list(source_coords_dict.keys())
-    source_coords_array = np.array([source_coords_dict[s] for s in source_stations])
+    return X, y, ts_list
 
-    for idx in test_indices:
-        source_values = []
-        for source in source_stations:
-            source_values.append(sequences[source]['y'][idx])
-        source_values = np.array(source_values)
-        pred = idw_interpolation(target_coord, source_coords_array, source_values)
-        predictions.append(pred)
-    return np.array(predictions)
-
-# ==================== 2. LSTM МОДЕЛЬ ====================
+# ==================== LSTM МОДЕЛЬ ====================
 
 class HeightAwareLSTM(nn.Module):
     """LSTM, который учитывает разницу высот между станциями"""
-    def __init__(self, input_size=1, hidden_size=64, num_layers=1, output_size=3, dropout=0.2):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=1, output_size=1, dropout=0.2):
         super(HeightAwareLSTM, self).__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.height_encoder = nn.Linear(1, hidden_size // 2)
@@ -242,7 +222,6 @@ class HeightAwareLSTM(nn.Module):
 def train_lstm_with_heights(model, X_train, y_train, height_diffs_train,
                             X_val, y_val, height_diffs_val,
                             epochs=50, lr=0.001, batch_size=64):
-    """Обучение LSTM с учетом разницы высот"""
     model = model.to(device)
 
     if len(X_train.shape) == 2:
@@ -272,16 +251,16 @@ def train_lstm_with_heights(model, X_train, y_train, height_diffs_train,
         total_loss = 0
         for batch_x, batch_y, batch_h in train_loader:
             optimizer.zero_grad()
-            output = model(batch_x, batch_h)
-            loss = criterion(output, batch_y)
+            output = model(batch_x, batch_h).squeeze()
+            loss = criterion(output, batch_y.squeeze())
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
         model.eval()
         with torch.no_grad():
-            val_pred = model(X_val_t, height_diffs_val_t)
-            val_loss = criterion(val_pred, y_val_t)
+            val_pred = model(X_val_t, height_diffs_val_t).squeeze()
+            val_loss = criterion(val_pred, y_val_t.squeeze())
 
         scheduler.step(val_loss)
 
@@ -300,35 +279,16 @@ def train_lstm_with_heights(model, X_train, y_train, height_diffs_train,
 
     return model.cpu()
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-
-def find_nearest_stations(target_station, station_coords, all_stations, n_neighbors=3):
-    """Находит n ближайших станций к целевой"""
-    target_coord = station_coords[target_station]
-    distances = []
-
-    for station in all_stations:
-        if station != target_station:
-            dist = np.linalg.norm(np.array(station_coords[station]) - np.array(target_coord))
-            distances.append((station, dist))
-
-    distances.sort(key=lambda x: x[1])
-    return distances[:n_neighbors]
-
 # ==================== ОСНОВНОЙ ЭКСПЕРИМЕНТ ====================
 
 def run_experiment_for_component(station_files_config, station_coords, station_heights,
-                                 lookback=24, forecast_horizon=3, stride=10, component='horizontal'):
-    """
-    Эксперимент для одной компоненты ветра
-
-    stride: шаг разрежения (1 - все последовательности, 10 - каждая 10-я)
-    """
+                                 lookback_minutes=360, forecast_minutes=180, stride_minutes=60,
+                                 component='horizontal'):
 
     print(f"\n{'='*80}")
     print(f"ЭКСПЕРИМЕНТ ДЛЯ {component.upper()} КОМПОНЕНТЫ ВЕТРА")
+    print(f"Прогноз на {forecast_minutes} минут ({forecast_minutes/60:.1f} часа) вперёд")
     print(f"{'='*80}")
-    print(f"Параметры: lookback={lookback}, forecast_horizon={forecast_horizon}, stride={stride}")
 
     # Загрузка данных
     print("\nЗагрузка данных...")
@@ -338,75 +298,45 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
         print(f"\nЗагрузка станции {name}:")
         stations_raw[name] = load_multiple_csv_files(file_patterns, name, station_heights[name], target_height=10.0)
 
-    # Выравнивание
-    print("\nВыравнивание данных по времени...")
-    aligned_stations = align_stations_data(stations_raw, lookback, forecast_horizon, component)
-
-    # Создание последовательностей с разрежением
-    print("\nСоздание непрерывных последовательностей с разрежением...")
-    sequences = create_continuous_sequences(aligned_stations, lookback, forecast_horizon, stride)
-
-    results = {}
-    predictions_details = {}
+    # Создание последовательностей
+    print("\nСоздание последовательностей...")
+    all_sequences = {}
+    for name, data in stations_raw.items():
+        print(f"\nСтанция {name}:")
+        X, y, ts = create_sequences_from_single_station(
+            data, lookback_minutes, forecast_minutes, stride_minutes, component
+        )
+        all_sequences[name] = {'X': X, 'y': y, 'timestamps': ts, 'height': station_heights[name]}
 
     station_names = list(station_files_config.keys())
+    results = {}
 
     # Для каждой станции как целевой
-    for target_idx, target_station in enumerate(station_names):
+    for target_station in station_names:
         print(f"\n{'='*70}")
         print(f"Целевая станция: {target_station}")
-        print(f"Высота: {station_heights[target_station]} м над уровнем моря")
+        print(f"Высота датчика: {station_heights[target_station]} м над землёй")
         print(f"{'='*70}")
 
-        # Находим ближайшие станции
-        nearest = find_nearest_stations(target_station, station_coords, station_names, n_neighbors=3)
-
-        print(f"\nБлижайшие станции (с учетом расположения):")
-        for station, dist in nearest:
-            height_diff = station_heights[station] - station_heights[target_station]
-            print(f"  {station}: расстояние {dist:.4f}°, разница высот {height_diff:+.1f} м")
-
-        nearest_station = nearest[0][0]
-        nearest_distance = nearest[0][1]
+        # Находим ближайшую станцию
+        nearest_station, nearest_distance_m = find_nearest_station_meters(target_station, station_coords, station_names)
         nearest_height_diff = station_heights[nearest_station] - station_heights[target_station]
 
-        farthest_station = nearest[-1][0]
-        farthest_distance = nearest[-1][1]
-        farthest_height_diff = station_heights[farthest_station] - station_heights[target_station]
+        print(f"\nБлижайшая станция: {nearest_station}")
+        print(f"  Расстояние: {nearest_distance_m:.0f} м ({nearest_distance_m/1000:.2f} км)")
+        print(f"  Разница высот датчиков: {nearest_height_diff:+.1f} м")
 
         # Данные целевой станции
-        target_X = sequences[target_station]['X']
-        target_y = sequences[target_station]['y']
-
+        target_X = all_sequences[target_station]['X']
+        target_y = all_sequences[target_station]['y']
         n_samples = len(target_X)
         train_size = int(0.7 * n_samples)
         val_size = int(0.15 * n_samples)
         test_indices = list(range(train_size + val_size, n_samples))
 
-        # ===== МЕТОД 1: IDW ИНТЕРПОЛЯЦИЯ =====
-        print(f"\nМетод 1: IDW интерполяция")
-
-        source_coords_dict = {s: station_coords[s] for s in station_names if s != target_station}
-        idw_predictions_scaled = idw_predict_sequence(
-            station_coords[target_station], source_coords_dict, sequences, test_indices
-        )
-
-        idw_actual_scaled = target_y[test_indices]
-
-        if component == 'horizontal':
-            idw_predictions_original = scale_horizontal_to_original(idw_predictions_scaled.flatten())
-            idw_actual_original = scale_horizontal_to_original(idw_actual_scaled.flatten())
-        else:
-            idw_predictions_original = scale_vertical_to_original(idw_predictions_scaled.flatten())
-            idw_actual_original = scale_vertical_to_original(idw_actual_scaled.flatten())
-
-        idw_mae = mean_absolute_error(idw_actual_original, idw_predictions_original)
-        idw_rmse = np.sqrt(mean_squared_error(idw_actual_original, idw_predictions_original))
-        idw_r2 = r2_score(idw_actual_original, idw_predictions_original)
-        print(f"  MAE: {idw_mae:.4f} м/с, RMSE: {idw_rmse:.4f} м/с, R²: {idw_r2:.4f}")
-
-        # ===== МЕТОД 2: ОБУЧЕНИЕ НА СОБСТВЕННОЙ ИСТОРИИ =====
-        print(f"\nМетод 2: LSTM, обученный на истории этой станции (baseline)")
+        # ===== BASELINE: обучение на собственной истории =====
+        print(f"\n--- Baseline: LSTM на истории этой станции ---")
+        print(f"  Всего: {n_samples}, Train: {train_size}, Val: {val_size}, Test: {len(test_indices)}")
 
         baseline_train_X = target_X[:train_size]
         baseline_train_y = target_y[:train_size]
@@ -414,11 +344,10 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
         baseline_val_y = target_y[train_size:train_size+val_size]
 
         if len(baseline_train_X.shape) == 2:
-            baseline_train_X = baseline_train_X.reshape(-1, lookback, 1)
-            baseline_val_X = baseline_val_X.reshape(-1, lookback, 1)
+            baseline_train_X = baseline_train_X.reshape(-1, lookback_minutes, 1)
+            baseline_val_X = baseline_val_X.reshape(-1, lookback_minutes, 1)
 
-        baseline_model = HeightAwareLSTM(input_size=1, hidden_size=64, num_layers=1,
-                                        output_size=forecast_horizon, dropout=0.2)
+        baseline_model = HeightAwareLSTM(input_size=1, hidden_size=64, num_layers=1, output_size=1, dropout=0.2)
 
         baseline_height_diffs_train = np.zeros((len(baseline_train_X), 1))
         baseline_height_diffs_val = np.zeros((len(baseline_val_X), 1))
@@ -431,7 +360,7 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
         baseline_test_y = target_y[test_indices]
 
         if len(baseline_test_X.shape) == 2:
-            baseline_test_X = baseline_test_X.reshape(-1, lookback, 1)
+            baseline_test_X = baseline_test_X.reshape(-1, lookback_minutes, 1)
 
         baseline_model.eval()
         baseline_model = baseline_model.to(device)
@@ -442,36 +371,42 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
                                                   torch.FloatTensor(baseline_height_diffs_test).to(device)).cpu().numpy()
 
         if component == 'horizontal':
-            baseline_pred_original = scale_horizontal_to_original(baseline_pred_scaled.flatten())
-            baseline_actual_original = scale_horizontal_to_original(baseline_test_y.flatten())
+            baseline_pred = scale_horizontal_to_original(baseline_pred_scaled.flatten())
+            baseline_actual = scale_horizontal_to_original(baseline_test_y.flatten())
         else:
-            baseline_pred_original = scale_vertical_to_original(baseline_pred_scaled.flatten())
-            baseline_actual_original = scale_vertical_to_original(baseline_test_y.flatten())
+            baseline_pred = scale_vertical_to_original(baseline_pred_scaled.flatten())
+            baseline_actual = scale_vertical_to_original(baseline_test_y.flatten())
 
-        baseline_mae = mean_absolute_error(baseline_actual_original, baseline_pred_original)
-        baseline_rmse = np.sqrt(mean_squared_error(baseline_actual_original, baseline_pred_original))
-        baseline_r2 = r2_score(baseline_actual_original, baseline_pred_original)
+        baseline_mae = mean_absolute_error(baseline_actual, baseline_pred)
+        baseline_rmse = np.sqrt(mean_squared_error(baseline_actual, baseline_pred))
+        baseline_r2 = r2_score(baseline_actual, baseline_pred)
 
-        print(f"  MAE: {baseline_mae:.4f} м/с, RMSE: {baseline_rmse:.4f} м/с, R²: {baseline_r2:.4f}")
+        print(f"  Baseline MAE: {baseline_mae:.4f} м/с, RMSE: {baseline_rmse:.4f} м/с, R²: {baseline_r2:.4f}")
 
-        # ===== МЕТОД 3: ПЕРЕНОС С БЛИЖАЙШЕЙ СТАНЦИИ =====
-        print(f"\nМетод 3: Перенос с БЛИЖАЙШЕЙ станции {nearest_station}")
-        print(f"  Расстояние: {nearest_distance:.4f}°, разница высот: {nearest_height_diff:+.1f} м")
+        # ===== TRANSFER: перенос с ближайшей станции =====
+        print(f"\n--- Transfer: перенос с ближайшей станции {nearest_station} ---")
 
-        transfer_train_X = sequences[nearest_station]['X'][:train_size]
-        transfer_train_y = sequences[nearest_station]['y'][:train_size]
-        transfer_val_X = sequences[nearest_station]['X'][train_size:train_size+val_size]
-        transfer_val_y = sequences[nearest_station]['y'][train_size:train_size+val_size]
+        source_X = all_sequences[nearest_station]['X']
+        source_y = all_sequences[nearest_station]['y']
+        n_source = len(source_X)
+        train_size_source = int(0.7 * n_source)
+        val_size_source = int(0.15 * n_source)
+
+        print(f"  Источник: всего {n_source}, Train: {train_size_source}, Val: {val_size_source}")
+
+        transfer_train_X = source_X[:train_size_source]
+        transfer_train_y = source_y[:train_size_source]
+        transfer_val_X = source_X[train_size_source:train_size_source+val_size_source]
+        transfer_val_y = source_y[train_size_source:train_size_source+val_size_source]
 
         if len(transfer_train_X.shape) == 2:
-            transfer_train_X = transfer_train_X.reshape(-1, lookback, 1)
-            transfer_val_X = transfer_val_X.reshape(-1, lookback, 1)
+            transfer_train_X = transfer_train_X.reshape(-1, lookback_minutes, 1)
+            transfer_val_X = transfer_val_X.reshape(-1, lookback_minutes, 1)
 
         transfer_height_diffs_train = np.full((len(transfer_train_X), 1), float(nearest_height_diff))
         transfer_height_diffs_val = np.full((len(transfer_val_X), 1), float(nearest_height_diff))
 
-        transfer_model = HeightAwareLSTM(input_size=1, hidden_size=64, num_layers=1,
-                                        output_size=forecast_horizon, dropout=0.2)
+        transfer_model = HeightAwareLSTM(input_size=1, hidden_size=64, num_layers=1, output_size=1, dropout=0.2)
         transfer_model = train_lstm_with_heights(transfer_model, transfer_train_X, transfer_train_y,
                                                 transfer_height_diffs_train, transfer_val_X, transfer_val_y,
                                                 transfer_height_diffs_val, epochs=50)
@@ -480,7 +415,7 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
         transfer_test_y = target_y[test_indices]
 
         if len(transfer_test_X.shape) == 2:
-            transfer_test_X = transfer_test_X.reshape(-1, lookback, 1)
+            transfer_test_X = transfer_test_X.reshape(-1, lookback_minutes, 1)
 
         transfer_model.eval()
         transfer_model = transfer_model.to(device)
@@ -491,96 +426,47 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
                                                   torch.FloatTensor(transfer_height_diffs_test).to(device)).cpu().numpy()
 
         if component == 'horizontal':
-            transfer_pred_original = scale_horizontal_to_original(transfer_pred_scaled.flatten())
-            transfer_actual_original = scale_horizontal_to_original(transfer_test_y.flatten())
+            transfer_pred = scale_horizontal_to_original(transfer_pred_scaled.flatten())
+            transfer_actual = scale_horizontal_to_original(transfer_test_y.flatten())
         else:
-            transfer_pred_original = scale_vertical_to_original(transfer_pred_scaled.flatten())
-            transfer_actual_original = scale_vertical_to_original(transfer_test_y.flatten())
+            transfer_pred = scale_vertical_to_original(transfer_pred_scaled.flatten())
+            transfer_actual = scale_vertical_to_original(transfer_test_y.flatten())
 
-        transfer_mae = mean_absolute_error(transfer_actual_original, transfer_pred_original)
-        transfer_rmse = np.sqrt(mean_squared_error(transfer_actual_original, transfer_pred_original))
-        transfer_r2 = r2_score(transfer_actual_original, transfer_pred_original)
+        transfer_mae = mean_absolute_error(transfer_actual, transfer_pred)
+        transfer_rmse = np.sqrt(mean_squared_error(transfer_actual, transfer_pred))
+        transfer_r2 = r2_score(transfer_actual, transfer_pred)
 
-        print(f"  MAE: {transfer_mae:.4f} м/с, RMSE: {transfer_rmse:.4f} м/с, R²: {transfer_r2:.4f}")
+        print(f"  Transfer MAE: {transfer_mae:.4f} м/с, RMSE: {transfer_rmse:.4f} м/с, R²: {transfer_r2:.4f}")
 
-        # ===== МЕТОД 4: ПЕРЕНОС С ДАЛЬНЕЙ СТАНЦИИ =====
-        print(f"\nМетод 4: Перенос с ДАЛЬНЕЙ станции {farthest_station}")
-        print(f"  Расстояние: {farthest_distance:.4f}°, разница высот: {farthest_height_diff:+.1f} м")
+        # ===== СРАВНЕНИЕ (проверка гипотезы) =====
+        diff = transfer_mae - baseline_mae
+        relative_diff = diff / baseline_mae * 100
 
-        far_train_X = sequences[farthest_station]['X'][:train_size]
-        far_train_y = sequences[farthest_station]['y'][:train_size]
-        far_val_X = sequences[farthest_station]['X'][train_size:train_size+val_size]
-        far_val_y = sequences[farthest_station]['y'][train_size:train_size+val_size]
+        print(f"\n  Проверка гипотезы:")
+        print(f"    Baseline MAE: {baseline_mae:.4f} м/с")
+        print(f"    Transfer MAE: {transfer_mae:.4f} м/с")
+        print(f"    Абсолютная разница: {diff:+.4f} м/с")
+        print(f"    Относительная разница: {relative_diff:+.1f}%")
 
-        if len(far_train_X.shape) == 2:
-            far_train_X = far_train_X.reshape(-1, lookback, 1)
-            far_val_X = far_val_X.reshape(-1, lookback, 1)
-
-        far_height_diffs_train = np.full((len(far_train_X), 1), float(farthest_height_diff))
-        far_height_diffs_val = np.full((len(far_val_X), 1), float(farthest_height_diff))
-
-        far_model = HeightAwareLSTM(input_size=1, hidden_size=64, num_layers=1,
-                                   output_size=forecast_horizon, dropout=0.2)
-        far_model = train_lstm_with_heights(far_model, far_train_X, far_train_y,
-                                           far_height_diffs_train, far_val_X, far_val_y,
-                                           far_height_diffs_val, epochs=50)
-
-        far_test_X = target_X[test_indices]
-        far_test_y = target_y[test_indices]
-
-        if len(far_test_X.shape) == 2:
-            far_test_X = far_test_X.reshape(-1, lookback, 1)
-
-        far_model.eval()
-        far_model = far_model.to(device)
-        far_height_diffs_test = np.full((len(far_test_X), 1), float(farthest_height_diff))
-
-        with torch.no_grad():
-            far_pred_scaled = far_model(torch.FloatTensor(far_test_X).to(device),
-                                        torch.FloatTensor(far_height_diffs_test).to(device)).cpu().numpy()
-
-        if component == 'horizontal':
-            far_pred_original = scale_horizontal_to_original(far_pred_scaled.flatten())
-            far_actual_original = scale_horizontal_to_original(far_test_y.flatten())
+        if abs(relative_diff) < 20:
+            print(f"    ✓ СОПОСТАВИМО (разница < 20%)")
         else:
-            far_pred_original = scale_vertical_to_original(far_pred_scaled.flatten())
-            far_actual_original = scale_vertical_to_original(far_test_y.flatten())
-
-        far_mae = mean_absolute_error(far_actual_original, far_pred_original)
-        far_rmse = np.sqrt(mean_squared_error(far_actual_original, far_pred_original))
-        far_r2 = r2_score(far_actual_original, far_pred_original)
-
-        print(f"  MAE: {far_mae:.4f} м/с, RMSE: {far_rmse:.4f} м/с, R²: {far_r2:.4f}")
-
-        # ===== СРАВНЕНИЕ =====
-        print(f"\n  СРАВНЕНИЕ МЕТОДОВ:")
-        print(f"  IDW (интерполяция):           {idw_mae:.4f} м/с")
-        print(f"  Baseline (своя история):      {baseline_mae:.4f} м/с")
-        print(f"  Transfer (ближайшая):         {transfer_mae:.4f} м/с")
-        print(f"  Transfer (дальняя):           {far_mae:.4f} м/с")
-
-        diff_idw_vs_baseline = abs(idw_mae - baseline_mae)
-        diff_transfer_vs_baseline = abs(baseline_mae - transfer_mae)
-        relative_diff_transfer = diff_transfer_vs_baseline / baseline_mae * 100
-
-        print(f"\n  IDW vs Baseline: разница {diff_idw_vs_baseline:.4f} м/с")
-        print(f"  Transfer vs Baseline: разница {diff_transfer_vs_baseline:.4f} м/с ({relative_diff_transfer:.1f}%)")
-
-        comparable = relative_diff_transfer < 20
-        print(f"  Вывод: {'✓ СОПОСТАВИМ' if comparable else '✗ НЕ СОПОСТАВИМ'} (порог 20%)")
+            print(f"    ✗ НЕ СОПОСТАВИМО (разница >= 20%)")
 
         results[target_station] = {
-            'idw': {'MAE': idw_mae, 'RMSE': idw_rmse, 'R2': idw_r2},
             'baseline': {'MAE': baseline_mae, 'RMSE': baseline_rmse, 'R2': baseline_r2},
-            'transfer_nearest': {'MAE': transfer_mae, 'RMSE': transfer_rmse, 'R2': transfer_r2,
-                                'distance': nearest_distance, 'station': nearest_station,
-                                'height_diff': nearest_height_diff},
-            'transfer_farthest': {'MAE': far_mae, 'RMSE': far_rmse, 'R2': far_r2,
-                                  'distance': farthest_distance, 'station': farthest_station,
-                                  'height_diff': farthest_height_diff},
-            'diff_transfer': diff_transfer_vs_baseline,
-            'relative_diff': relative_diff_transfer,
-            'comparable': comparable
+            'transfer': {
+                'MAE': transfer_mae,
+                'RMSE': transfer_rmse,
+                'R2': transfer_r2,
+                'source_station': nearest_station,
+                'distance_m': nearest_distance_m,
+                'distance_km': nearest_distance_m / 1000,
+                'height_diff': nearest_height_diff
+            },
+            'diff': diff,
+            'relative_diff': relative_diff,
+            'comparable': abs(relative_diff) < 20
         }
 
         if device.type == 'cuda':
@@ -591,64 +477,98 @@ def run_experiment_for_component(station_files_config, station_coords, station_h
 
 # ==================== ПРОВЕРКА ГИПОТЕЗЫ ====================
 
-def test_hypothesis(results, component_name):
-    """Проверка гипотезы"""
+def test_hypothesis(results, component_name, forecast_minutes=180):
+    """Проверка гипотезы о сопоставимости переноса обучения"""
+
     print(f"\n{'='*80}")
     print(f"ПРОВЕРКА ГИПОТЕЗЫ ДЛЯ {component_name.upper()} КОМПОНЕНТЫ")
     print(f"{'='*80}")
+    print("Гипотеза: прогноз скорости ветра в локации, не имеющей собственной истории,")
+    print("может быть выполнен с точностью, СОПОСТАВИМОЙ с точностью прогноза")
+    print("для станций, располагающих репрезентативным историческим рядом,")
+    print("путем переноса знаний от обученной модели с использованием данных окружающих станций.")
+    print(f"{'='*80}")
 
-    baseline_maes = [results[s]['baseline']['MAE'] for s in results]
-    transfer_maes = [results[s]['transfer_nearest']['MAE'] for s in results]
-    idw_maes = [results[s]['idw']['MAE'] for s in results]
+    stations = list(results.keys())
+    n_stations = len(stations)
 
-    comparable_stations = [s for s in results if results[s]['comparable']]
+    baseline_maes = [results[s]['baseline']['MAE'] for s in stations]
+    transfer_maes = [results[s]['transfer']['MAE'] for s in stations]
+    relative_diffs = [results[s]['relative_diff'] for s in stations]
+    comparable_stations = [s for s in stations if results[s]['comparable']]
 
     mean_baseline = np.mean(baseline_maes)
     mean_transfer = np.mean(transfer_maes)
-    mean_idw = np.mean(idw_maes)
-
-    print(f"\nСРЕДНИЕ ЗНАЧЕНИЯ ПО ВСЕМ СТАНЦИЯМ:")
-    print(f"  IDW (интерполяция):           {mean_idw:.4f} м/с")
-    print(f"  Baseline (своя история):      {mean_baseline:.4f} м/с")
-    print(f"  Transfer (ближайшая):         {mean_transfer:.4f} м/с")
-
-    print(f"\nРЕЗУЛЬТАТЫ ПО КАЖДОЙ СТАНЦИИ:")
-    print(f"{'Станция':<20} {'Расст':<8} {'IDW':<10} {'Baseline':<10} {'Transfer':<10} {'Разница':<10} {'Статус':<12}")
-    print("-" * 85)
-
-    for station in results:
-        dist = results[station]['transfer_nearest']['distance']
-        idw_val = results[station]['idw']['MAE']
-        baseline = results[station]['baseline']['MAE']
-        transfer = results[station]['transfer_nearest']['MAE']
-        diff = results[station]['diff_transfer']
-        status = "✓ СОПОСТАВИМ" if results[station]['comparable'] else "✗ НЕ СОПОСТАВИМ"
-        print(f"{station:<20} {dist:<8.3f} {idw_val:<10.4f} {baseline:<10.4f} {transfer:<10.4f} {diff:<10.4f} {status}")
+    mean_relative_diff = np.mean(relative_diffs)
+    median_relative_diff = np.median(relative_diffs)
 
     comparable_count = len(comparable_stations)
-    total_count = len(results)
-    comparable_ratio = comparable_count / total_count
+    comparable_ratio = comparable_count / n_stations
 
+    print(f"\n--- РЕЗУЛЬТАТЫ ЭКСПЕРИМЕНТА ---")
+    print(f"  Количество станций: {n_stations}")
+    print(f"  Горизонт прогноза: {forecast_minutes} мин ({forecast_minutes/60:.1f} ч)")
+    print(f"  Средняя MAE Baseline:  {mean_baseline:.4f} м/с")
+    print(f"  Средняя MAE Transfer:  {mean_transfer:.4f} м/с")
+    print(f"  Средняя относительная разница: {mean_relative_diff:+.1f}%")
+    print(f"  Медианная относительная разница: {median_relative_diff:+.1f}%")
+
+    print(f"\n--- СОПОСТАВИМОСТЬ ПО СТАНЦИЯМ ---")
+    print(f"  Сопоставимо (разница < 20%): {comparable_count} из {n_stations} ({comparable_ratio*100:.0f}%)")
+
+    for station in stations:
+        status = "✓ СОПОСТАВИМО" if results[station]['comparable'] else "✗ НЕ СОПОСТАВИМО"
+        print(f"    {station}: {status} (разница {results[station]['relative_diff']:+.1f}%)")
+
+    print(f"\n--- ДЕТАЛЬНЫЕ РЕЗУЛЬТАТЫ ---")
+    print(f"{'Целевая':<16} {'Источник':<16} {'Расст, км':<10} {'Перепад':<10} {'Baseline':<8} {'Transfer':<8} {'Разница':<10} {'Сопоставимо':<12}")
+    print("-" * 100)
+
+    for station in stations:
+        dist_km = results[station]['transfer']['distance_km']
+        height_diff = results[station]['transfer']['height_diff']
+        baseline = results[station]['baseline']['MAE']
+        transfer = results[station]['transfer']['MAE']
+        diff = results[station]['diff']
+        comparable = "✓" if results[station]['comparable'] else "✗"
+        source = results[station]['transfer']['source_station']
+        print(f"{station:<16} {source:<16} {dist_km:<10.2f} {height_diff:+8.1f}м {baseline:<8.4f} {transfer:<8.4f} {diff:+8.4f} {comparable:<12}")
+
+    # Статистический тест
     t_stat, p_value = ttest_rel(baseline_maes, transfer_maes)
-    print(f"\nСТАТИСТИЧЕСКИЙ ТЕСТ (Baseline vs Transfer):")
-    print(f"  t={t_stat:.4f}, p={p_value:.4f}")
+    print(f"\n--- СТАТИСТИЧЕСКИЙ ТЕСТ (парный t-test) ---")
+    print(f"  t = {t_stat:.4f}, p = {p_value:.4f}")
 
+    if p_value < 0.05:
+        print("  Различия статистически ЗНАЧИМЫ (p < 0.05)")
+    else:
+        print("  Различия статистически НЕ ЗНАЧИМЫ (p ≥ 0.05)")
+
+    # Итоговый вывод
     print("\n" + "="*80)
-    print("ИТОГОВЫЙ ВЫВОД")
+    print("ВЫВОД ПО ГИПОТЕЗЕ")
     print("="*80)
 
     if comparable_ratio >= 0.5:
-        print(f"✅ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ для {component_name} компоненты")
-        print(f"  Для {comparable_count} из {total_count} станций ({comparable_ratio*100:.0f}%)")
-        print("  перенос с БЛИЖАЙШЕЙ станции дает точность, сопоставимую с собственной историей")
+        print(f"✅ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ")
+        print(f"   Для {comparable_count} из {n_stations} станций ({comparable_ratio*100:.0f}%)")
+        print(f"   перенос обучения с ближайшей станции даёт точность, сопоставимую")
+        print(f"   с обучением на собственной истории (разница MAE < 20%).")
     else:
-        print(f"❌ ГИПОТЕЗА НЕ ПОДТВЕРЖДАЕТСЯ для {component_name} компоненты")
-        print(f"  Только для {comparable_count} из {total_count} станций ({comparable_ratio*100:.0f}%)")
+        print(f"❌ ГИПОТЕЗА НЕ ПОДТВЕРЖДАЕТСЯ")
+        print(f"   Только для {comparable_count} из {n_stations} станций ({comparable_ratio*100:.0f}%)")
+        print(f"   перенос обучения с ближайшей станции НЕ обеспечивает")
+        print(f"   сопоставимую точность (разница MAE > 20%).")
+
+    print(f"\nСтатистика:")
+    print(f"  Средняя MAE Baseline:  {mean_baseline:.4f} м/с")
+    print(f"  Средняя MAE Transfer:  {mean_transfer:.4f} м/с")
+    print(f"  Средняя разница:       {mean_transfer - mean_baseline:+.4f} м/с ({mean_relative_diff:+.1f}%)")
+    print(f"  p-value: {p_value:.4f}")
 
     return {
         'mean_baseline': mean_baseline,
         'mean_transfer': mean_transfer,
-        'mean_idw': mean_idw,
         'comparable_ratio': comparable_ratio,
         'p_value': p_value,
         'hypothesis_confirmed': comparable_ratio >= 0.5
@@ -656,117 +576,75 @@ def test_hypothesis(results, component_name):
 
 # ==================== ВИЗУАЛИЗАЦИЯ ====================
 
-def visualize_comparison(results_hor, results_ver):
-    """Визуализация сравнения двух компонент"""
-
+def visualize_results(results_hor, results_ver, forecast_minutes=180):
     stations = list(results_hor.keys())
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    # 1. Сравнение MAE горизонтальной компоненты
-    ax1 = axes[0, 0]
+    # 1. Сравнение MAE (горизонтальная)
+    ax1 = axes[0]
     x = np.arange(len(stations))
-    width = 0.25
-    idw_hor = [results_hor[s]['idw']['MAE'] for s in stations]
+    width = 0.35
     baseline_hor = [results_hor[s]['baseline']['MAE'] for s in stations]
-    transfer_hor = [results_hor[s]['transfer_nearest']['MAE'] for s in stations]
+    transfer_hor = [results_hor[s]['transfer']['MAE'] for s in stations]
 
-    ax1.bar(x - width, idw_hor, width, label='IDW', color='#3498db', alpha=0.7, edgecolor='black')
-    ax1.bar(x, baseline_hor, width, label='Baseline', color='#2ecc71', alpha=0.7, edgecolor='black')
-    ax1.bar(x + width, transfer_hor, width, label='Transfer', color='#e74c3c', alpha=0.7, edgecolor='black')
+    ax1.bar(x - width/2, baseline_hor, width, label='Baseline (своя история)', color='#2ecc71', alpha=0.7)
+    ax1.bar(x + width/2, transfer_hor, width, label='Transfer (ближайшая)', color='#e74c3c', alpha=0.7)
     ax1.set_xlabel('Станция')
     ax1.set_ylabel('MAE (м/с)')
-    ax1.set_title('Горизонтальная компонента ветра')
+    ax1.set_title(f'Горизонтальная компонента\n(прогноз на {forecast_minutes/60:.0f} ч)')
     ax1.set_xticks(x)
     ax1.set_xticklabels(stations, rotation=45)
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # 2. Сравнение MAE вертикальной компоненты
-    ax2 = axes[0, 1]
-    idw_ver = [results_ver[s]['idw']['MAE'] for s in stations]
-    baseline_ver = [results_ver[s]['baseline']['MAE'] for s in stations]
-    transfer_ver = [results_ver[s]['transfer_nearest']['MAE'] for s in stations]
+    for i, (b, t) in enumerate(zip(baseline_hor, transfer_hor)):
+        ax1.text(i - width/2, b + 0.01, f'{b:.3f}', ha='center', va='bottom', fontsize=8)
+        ax1.text(i + width/2, t + 0.01, f'{t:.3f}', ha='center', va='bottom', fontsize=8)
 
-    ax2.bar(x - width, idw_ver, width, label='IDW', color='#3498db', alpha=0.7, edgecolor='black')
-    ax2.bar(x, baseline_ver, width, label='Baseline', color='#2ecc71', alpha=0.7, edgecolor='black')
-    ax2.bar(x + width, transfer_ver, width, label='Transfer', color='#e74c3c', alpha=0.7, edgecolor='black')
+    # 2. Сравнение MAE (вертикальная)
+    ax2 = axes[1]
+    baseline_ver = [results_ver[s]['baseline']['MAE'] for s in stations]
+    transfer_ver = [results_ver[s]['transfer']['MAE'] for s in stations]
+
+    ax2.bar(x - width/2, baseline_ver, width, label='Baseline (своя история)', color='#2ecc71', alpha=0.7)
+    ax2.bar(x + width/2, transfer_ver, width, label='Transfer (ближайшая)', color='#e74c3c', alpha=0.7)
     ax2.set_xlabel('Станция')
     ax2.set_ylabel('MAE (м/с)')
-    ax2.set_title('Вертикальная компонента ветра')
+    ax2.set_title(f'Вертикальная компонента\n(прогноз на {forecast_minutes/60:.0f} ч)')
     ax2.set_xticks(x)
     ax2.set_xticklabels(stations, rotation=45)
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
-    # 3. Сравнение Transfer с Baseline (горизонтальная)
-    ax3 = axes[0, 2]
-    rel_errors_hor = [results_hor[s]['relative_diff'] for s in stations]
-    colors_hor = ['#2ecc71' if results_hor[s]['comparable'] else '#e74c3c' for s in stations]
-    bars = ax3.bar(stations, rel_errors_hor, color=colors_hor, alpha=0.7, edgecolor='black')
-    ax3.axhline(y=20, color='red', linestyle='--', linewidth=2, label='Порог 20%')
+    for i, (b, t) in enumerate(zip(baseline_ver, transfer_ver)):
+        ax2.text(i - width/2, b + 0.01, f'{b:.3f}', ha='center', va='bottom', fontsize=8)
+        ax2.text(i + width/2, t + 0.01, f'{t:.3f}', ha='center', va='bottom', fontsize=8)
+
+    # 3. Относительная разница
+    ax3 = axes[2]
+    rel_diffs_hor = [results_hor[s]['relative_diff'] for s in stations]
+    colors = ['#2ecc71' if abs(rd) < 20 else '#e74c3c' for rd in rel_diffs_hor]
+    bars = ax3.bar(stations, rel_diffs_hor, color=colors, alpha=0.7, edgecolor='black')
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax3.axhline(y=20, color='red', linestyle='--', linewidth=1.5, label='Порог 20%')
+    ax3.axhline(y=-20, color='red', linestyle='--', linewidth=1.5)
     ax3.set_xlabel('Станция')
-    ax3.set_ylabel('Относительная ошибка (%)')
-    ax3.set_title('Горизонтальная: Transfer vs Baseline')
+    ax3.set_ylabel('Относительная разница (%)')
+    ax3.set_title('Transfer vs Baseline\n(отрицательное = Transfer лучше)')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
 
-    for bar, value in zip(bars, rel_errors_hor):
-        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                f'{value:.1f}%', ha='center', va='bottom', fontsize=8)
-
-    # 4. Сравнение Transfer с Baseline (вертикальная)
-    ax4 = axes[1, 0]
-    rel_errors_ver = [results_ver[s]['relative_diff'] for s in stations]
-    colors_ver = ['#2ecc71' if results_ver[s]['comparable'] else '#e74c3c' for s in stations]
-    bars = ax4.bar(stations, rel_errors_ver, color=colors_ver, alpha=0.7, edgecolor='black')
-    ax4.axhline(y=20, color='red', linestyle='--', linewidth=2, label='Порог 20%')
-    ax4.set_xlabel('Станция')
-    ax4.set_ylabel('Относительная ошибка (%)')
-    ax4.set_title('Вертикальная: Transfer vs Baseline')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
-
-    for bar, value in zip(bars, rel_errors_ver):
-        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                f'{value:.1f}%', ha='center', va='bottom', fontsize=8)
-
-    # 5. Сравнение IDW и Transfer (горизонтальная)
-    ax5 = axes[1, 1]
-    idw_vs_transfer_hor = [abs(results_hor[s]['idw']['MAE'] - results_hor[s]['transfer_nearest']['MAE']) for s in stations]
-    bars = ax5.bar(stations, idw_vs_transfer_hor, color='#9b59b6', alpha=0.7, edgecolor='black')
-    ax5.set_xlabel('Станция')
-    ax5.set_ylabel('Абсолютная разница (м/с)')
-    ax5.set_title('Горизонтальная: IDW vs Transfer')
-    ax5.grid(True, alpha=0.3)
-
-    for bar, value in zip(bars, idw_vs_transfer_hor):
-        ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                f'{value:.3f}', ha='center', va='bottom', fontsize=8)
-
-    # 6. Сравнение IDW и Transfer (вертикальная)
-    ax6 = axes[1, 2]
-    idw_vs_transfer_ver = [abs(results_ver[s]['idw']['MAE'] - results_ver[s]['transfer_nearest']['MAE']) for s in stations]
-    bars = ax6.bar(stations, idw_vs_transfer_ver, color='#9b59b6', alpha=0.7, edgecolor='black')
-    ax6.set_xlabel('Станция')
-    ax6.set_ylabel('Абсолютная разница (м/с)')
-    ax6.set_title('Вертикальная: IDW vs Transfer')
-    ax6.grid(True, alpha=0.3)
-
-    for bar, value in zip(bars, idw_vs_transfer_ver):
-        ax6.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                f'{value:.3f}', ha='center', va='bottom', fontsize=8)
+    for bar, value in zip(bars, rel_diffs_hor):
+        ax3.text(bar.get_x() + bar.get_width()/2, value + (3 if value >= 0 else -10),
+                f'{value:.1f}%', ha='center', va='bottom' if value >= 0 else 'top', fontsize=8)
 
     plt.tight_layout()
-    plt.savefig('wind_components_comparison.png', dpi=150, bbox_inches='tight')
     plt.show()
 
 # ==================== ЗАПУСК ====================
 
 def main():
-    """Главная функция"""
-
-    # Конфигурация файлов для каждой станции
     station_files_config = {
         'kinzjar_10m': ["autumn_kinzjar_10m.csv", "summer_kinzjar_10m.csv", "winter_kinzjar_10m.csv"],
         'kireevsk_10m': ["autumn_kireevsk_10m.csv", "summer_kireevsk_10m.csv", "winter_kireevsk_10m.csv"],
@@ -774,7 +652,6 @@ def main():
         'oblkom_27m': ["autumn_oblkom_27m.csv", "summer_oblkom_26m.csv", "winter_oblkom_27m.csv"],
     }
 
-    # Координаты станций
     station_coords = {
         'kinzjar_10m': (57.6217, 82.3392),
         'kireevsk_10m': (56.4150, 84.0678),
@@ -782,85 +659,72 @@ def main():
         'oblkom_27m': (56.4672222, 84.9575),
     }
 
-    # Высоты станций
+    # ВЫСОТЫ ДАТЧИКОВ НАД ЗЕМЛЁЙ (исходя из названия станции)
     station_heights = {
-        'kinzjar_10m': 80.0,
-        'kireevsk_10m': 91.0,
-        'imces_27m': 194.0,
-        'oblkom_27m': 139.0,
+        'kinzjar_10m': 10.0,   # 10-метровая мачта
+        'kireevsk_10m': 10.0,  # 10-метровая мачта
+        'imces_27m': 27.0,     # 27-метровая мачта
+        'oblkom_27m': 27.0,    # 27-метровая мачта
     }
 
-    # Параметры эксперимента
-    lookback = 6          # 6 часов (360 минут)
-    forecast_horizon = 3  # прогноз на 3 часа
-    stride = 70           # разрежение
+    # ПАРАМЕТРЫ ЭКСПЕРИМЕНТА (для поминутных данных)
+    lookback_minutes = 360      # часов истории
+    forecast_minutes = 180      # прогноз на 3 часа (180 минут)
+    stride_minutes = 180         # шаг между примерами
 
     print("="*80)
-    print("ЭКСПЕРИМЕНТ ДЛЯ ДВУХ КОМПОНЕНТ ВЕТРА")
+    print("ПРОВЕРКА ГИПОТЕЗЫ О ПЕРЕНОСЕ ОБУЧЕНИЯ ДЛЯ ПРОГНОЗА ВЕТРА")
     print("="*80)
-    print(f"Lookback window: {lookback} часов")
-    print(f"Прогнозный горизонт: {forecast_horizon} часа")
-    print(f"Stride (разрежение): {stride}")
+    print(f"Данные: поминутные")
+    print(f"Lookback: {lookback_minutes} минут ({lookback_minutes/60:.1f} часов)")
+    print(f"Прогноз: на {forecast_minutes} минут ({forecast_minutes/60:.1f} часа)")
+    print(f"Stride: {stride_minutes} минут ({stride_minutes/60:.1f} час) между примерами")
     print(f"Количество станций: {len(station_files_config)}")
     print(f"Устройство: {device}")
-
-    print("\nИнформация о станциях:")
-    for name in station_files_config.keys():
-        coords = station_coords[name]
-        height = station_heights[name]
-        print(f"  {name}: ({coords[0]:.4f}, {coords[1]:.4f}), высота {height} м")
 
     try:
         # Запуск для горизонтальной компоненты
         results_horizontal = run_experiment_for_component(
             station_files_config, station_coords, station_heights,
-            lookback, forecast_horizon, stride=stride, component='horizontal'
+            lookback_minutes, forecast_minutes, stride_minutes, component='horizontal'
         )
 
         # Запуск для вертикальной компоненты
         results_vertical = run_experiment_for_component(
             station_files_config, station_coords, station_heights,
-            lookback, forecast_horizon, stride=stride, component='vertical'
+            lookback_minutes, forecast_minutes, stride_minutes, component='vertical'
         )
 
-        # Проверка гипотез
-        hypothesis_hor = test_hypothesis(results_horizontal, 'horizontal')
-        hypothesis_ver = test_hypothesis(results_vertical, 'vertical')
+        # Проверка гипотезы
+        hypothesis_hor = test_hypothesis(results_horizontal, 'horizontal', forecast_minutes)
+        hypothesis_ver = test_hypothesis(results_vertical, 'vertical', forecast_minutes)
 
         # Визуализация
-        visualize_comparison(results_horizontal, results_vertical)
+        visualize_results(results_horizontal, results_vertical, forecast_minutes)
 
-        # Итоговый вывод
+        # Итоговый вердикт
         print("\n" + "="*80)
         print("ИТОГОВЫЙ ВЕРДИКТ ПО ОБЕИМ КОМПОНЕНТАМ")
         print("="*80)
 
-        print(f"\nГоризонтальная компонента (горизонт прогноза {forecast_horizon} ч):")
-        if hypothesis_hor['hypothesis_confirmed']:
-            print("  ✅ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ")
-            print(f"     Доля сопоставимых случаев: {hypothesis_hor['comparable_ratio']*100:.0f}%")
-            print(f"     Средняя MAE Baseline: {hypothesis_hor['mean_baseline']:.3f} м/с")
-            print(f"     Средняя MAE Transfer: {hypothesis_hor['mean_transfer']:.3f} м/с")
-            print(f"     Средняя MAE IDW:      {hypothesis_hor['mean_idw']:.3f} м/с")
-            print(f"     p-value: {hypothesis_hor['p_value']:.4f}")
-        else:
-            print("  ❌ ГИПОТЕЗА НЕ ПОДТВЕРЖДАЕТСЯ")
+        print(f"\n--- Горизонтальная компонента (прогноз на {forecast_minutes/60:.0f} ч) ---")
+        print(f"  Доля сопоставимых случаев: {hypothesis_hor['comparable_ratio']*100:.0f}%")
+        print(f"  Средняя MAE Baseline:  {hypothesis_hor['mean_baseline']:.4f} м/с")
+        print(f"  Средняя MAE Transfer:  {hypothesis_hor['mean_transfer']:.4f} м/с")
+        print(f"  p-value: {hypothesis_hor['p_value']:.4f}")
+        print(f"  Гипотеза: {'ПОДТВЕРЖДАЕТСЯ ✅' if hypothesis_hor['hypothesis_confirmed'] else 'НЕ ПОДТВЕРЖДАЕТСЯ ❌'}")
 
-        print(f"\nВертикальная компонента (горизонт прогноза {forecast_horizon} ч):")
-        if hypothesis_ver['hypothesis_confirmed']:
-            print("  ✅ ГИПОТЕЗА ПОДТВЕРЖДАЕТСЯ")
-            print(f"     Доля сопоставимых случаев: {hypothesis_ver['comparable_ratio']*100:.0f}%")
-            print(f"     Средняя MAE Baseline: {hypothesis_ver['mean_baseline']:.3f} м/с")
-            print(f"     Средняя MAE Transfer: {hypothesis_ver['mean_transfer']:.3f} м/с")
-            print(f"     Средняя MAE IDW:      {hypothesis_ver['mean_idw']:.3f} м/с")
-            print(f"     p-value: {hypothesis_ver['p_value']:.4f}")
-        else:
-            print("  ❌ ГИПОТЕЗА НЕ ПОДТВЕРЖДАЕТСЯ")
+        print(f"\n--- Вертикальная компонента (прогноз на {forecast_minutes/60:.0f} ч) ---")
+        print(f"  Доля сопоставимых случаев: {hypothesis_ver['comparable_ratio']*100:.0f}%")
+        print(f"  Средняя MAE Baseline:  {hypothesis_ver['mean_baseline']:.4f} м/с")
+        print(f"  Средняя MAE Transfer:  {hypothesis_ver['mean_transfer']:.4f} м/с")
+        print(f"  p-value: {hypothesis_ver['p_value']:.4f}")
+        print(f"  Гипотеза: {'ПОДТВЕРЖДАЕТСЯ ✅' if hypothesis_ver['hypothesis_confirmed'] else 'НЕ ПОДТВЕРЖДАЕТСЯ ❌'}")
 
         print("="*80)
 
     except Exception as e:
-        print(f"\nОшибка при выполнении эксперимента: {e}")
+        print(f"\nОшибка: {e}")
         import traceback
         traceback.print_exc()
 
